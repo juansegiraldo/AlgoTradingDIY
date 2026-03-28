@@ -237,9 +237,11 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "\U0001f4d6 <b>10X Trading Bot - Ayuda</b>\n\n"
-        "/start - Registrar chat y obtener ID\n"
         "/status - Resumen del portfolio\n"
         "/positions - Posiciones abiertas\n"
+        "/force - Comprar YA (ej: /force btc, /force eth, /force sol short)\n"
+        "/test - Trade de prueba con GO/SKIP\n"
+        "/scan - Escanear mercados ahora\n"
         "/pause - Pausar todo el sistema\n"
         "/resume - Reanudar el sistema\n"
         "/help - Este mensaje\n\n"
@@ -251,6 +253,200 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ),
         parse_mode="HTML",
     )
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force a test trade with real BTC price and GO/SKIP buttons."""
+    await update.message.reply_text(
+        "\U0001f9ea <b>Preparando trade de prueba...</b>",
+        parse_mode="HTML",
+    )
+
+    try:
+        from execution.binance_executor import fetch_price
+        from risk.position_sizer import enrich_signal_with_sizing
+        from risk.risk_manager import validate_trade
+        from signals.signal_generator import format_signal_for_telegram
+        from data.database import get_latest_equity, save_equity_snapshot
+        import uuid
+
+        # Ensure equity exists
+        if not get_latest_equity():
+            save_equity_snapshot(total_capital=get_settings().get("initial_capital_gbp", 1000))
+
+        # Get live price
+        btc_price = fetch_price("BTC/USDT")
+
+        # Build signal
+        signal = {
+            "pair": "BTC/USDT",
+            "timeframe": "1h",
+            "market": "crypto",
+            "direction": "long",
+            "entry_price": btc_price,
+            "stop_loss": round(btc_price * 0.98, 2),
+            "take_profit_1": round(btc_price * 1.03, 2),
+            "take_profit_2": round(btc_price * 1.06, 2),
+            "leverage": 5,
+            "signal_count": 3,
+            "min_required": 3,
+            "signals_triggered": {"rsi": True, "ema": True, "macd": False, "volume": True},
+            "trend": "bullish",
+            "strength": "moderate (TEST)",
+        }
+
+        # Size and validate
+        signal = enrich_signal_with_sizing(signal)
+        validation = validate_trade(signal)
+
+        if not validation["approved"]:
+            reasons = "\n".join(f"  - {r}" for r in validation["rejection_reasons"])
+            await update.message.reply_text(
+                f"\u26d4 <b>Trade rechazado por reglas de riesgo:</b>\n{reasons}",
+                parse_mode="HTML",
+            )
+            return
+
+        # Send alert with GO/SKIP
+        signal_id = f"test_{uuid.uuid4().hex[:6]}"
+        _pending_signals[signal_id] = signal
+
+        tg_signal = format_signal_for_telegram(
+            signal,
+            risk_gbp=signal.get("risk_gbp", 0),
+            risk_pct=signal.get("risk_pct", 0),
+            position_size=f"{signal.get('position_size', 0):.6f} BTC",
+        )
+        text = format_signal_alert(tg_signal)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\u2705 GO", callback_data=f"go:{signal_id}"),
+                InlineKeyboardButton("\u23ed SKIP", callback_data=f"skip:{signal_id}"),
+            ]
+        ])
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"\u274c <b>Error:</b> {e}",
+            parse_mode="HTML",
+        )
+
+
+async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force buy immediately — no rules, no confirmation. Just buy."""
+    args = (context.args or [])
+    pair = args[0].upper() if args else "BTC/USDT"
+    # Normalize: "btc" -> "BTC/USDT"
+    if "/" not in pair:
+        pair = pair + "/USDT"
+
+    direction = "long"
+    if len(args) > 1 and args[1].lower() in ("short", "sell"):
+        direction = "short"
+
+    await update.message.reply_text(
+        f"\U0001f525 <b>FORCE {direction.upper()} {pair}...</b>",
+        parse_mode="HTML",
+    )
+
+    try:
+        from execution.binance_executor import fetch_price
+        from risk.position_sizer import enrich_signal_with_sizing
+        from pipeline import execute_signal
+        from data.database import get_latest_equity, save_equity_snapshot
+
+        if not get_latest_equity():
+            save_equity_snapshot(total_capital=get_settings().get("initial_capital_gbp", 1000))
+
+        price = fetch_price(pair)
+
+        if direction == "long":
+            sl = round(price * 0.98, 2)
+            tp1 = round(price * 1.03, 2)
+            tp2 = round(price * 1.06, 2)
+        else:
+            sl = round(price * 1.02, 2)
+            tp1 = round(price * 0.97, 2)
+            tp2 = round(price * 0.94, 2)
+
+        signal = {
+            "pair": pair,
+            "timeframe": "manual",
+            "market": "crypto",
+            "direction": direction,
+            "entry_price": price,
+            "stop_loss": sl,
+            "take_profit_1": tp1,
+            "take_profit_2": tp2,
+            "leverage": 5,
+            "signal_count": 4,
+            "min_required": 3,
+            "signals_triggered": {"manual": True},
+            "trend": "forced",
+            "strength": "manual",
+        }
+
+        signal = enrich_signal_with_sizing(signal)
+        result = execute_signal(signal)
+
+        if result.get("success"):
+            entry = result.get("entry_price", price)
+            mode = get_settings().get("mode", "paper").upper()
+            await update.message.reply_text(
+                f"\u2705 <b>COMPRADO ({mode})</b>\n\n"
+                f"\U0001f4c4 {pair} {direction.upper()}\n"
+                f"\U0001f4b0 Entrada: ${entry:,.2f}\n"
+                f"\U0001f6d1 SL: ${sl:,.2f}\n"
+                f"\U0001f3af TP1: ${tp1:,.2f} | TP2: ${tp2:,.2f}\n"
+                f"\U0001f4ca Size: {signal['position_size']:.6f}\n"
+                f"\U0001f4aa Leverage: 5x\n"
+                f"\U0001f3f7 Trade #{result.get('trade_id')}",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"\u274c <b>Error:</b> {result.get('error')}",
+                parse_mode="HTML",
+            )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"\u274c <b>Error:</b> {e}",
+            parse_mode="HTML",
+        )
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a manual scan right now."""
+    await update.message.reply_text(
+        "\U0001f50d <b>Escaneando mercados...</b>",
+        parse_mode="HTML",
+    )
+
+    try:
+        from pipeline import run_scan_cycle
+        signals = run_scan_cycle()
+
+        if signals:
+            text = f"\U0001f4e1 <b>{len(signals)} senal(es) detectada(s)!</b>\n\n"
+            for s in signals:
+                text += f"  - {s['pair']} ({s['timeframe']}) {s['direction'].upper()}\n"
+            text += "\n<i>Las alertas con GO/SKIP se enviaron arriba.</i>"
+        else:
+            text = (
+                "\U0001f4ad <b>Sin senales en este momento.</b>\n\n"
+                "Los 3 pares (BTC, ETH, SOL) fueron analizados en 1h y 4h.\n"
+                "Ninguno tiene 3/4 indicadores alineados ahora.\n\n"
+                "<i>El scanner automatico revisa cada 5 minutos.</i>"
+            )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"\u274c <b>Error:</b> {e}",
+            parse_mode="HTML",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +595,9 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("start", cmd_start))
     _app.add_handler(CommandHandler("status", cmd_status))
     _app.add_handler(CommandHandler("positions", cmd_positions))
+    _app.add_handler(CommandHandler("test", cmd_test))
+    _app.add_handler(CommandHandler("force", cmd_force))
+    _app.add_handler(CommandHandler("scan", cmd_scan))
     _app.add_handler(CommandHandler("pause", cmd_pause))
     _app.add_handler(CommandHandler("resume", cmd_resume))
     _app.add_handler(CommandHandler("help", cmd_help))
