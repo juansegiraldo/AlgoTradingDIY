@@ -1,0 +1,67 @@
+mode: paper  # paper | semi_auto | full_auto | pause
+
+markets:
+  crypto:
+    exchange: binance
+    pairs: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    timeframes: ["1h", "4h"]
+    leverage_default: 5
+    leverage_max: 10
+    capital_allocation_pct: 50
+    use_testnet: true  # cambiar a false para live
+
+  forex:
+    broker: oanda
+    pairs: ["EUR_USD", "GBP_USD", "USD_JPY"]
+    timeframes: ["H4", "D"]
+    leverage_default: 15
+    leverage_max: 20
+    capital_allocation_pct: 30
+    use_practice: true  # cambiar a false para live
+
+  etfs:
+    broker: ibkr
+    symbols: ["TQQQ", "SOXL", "SQQQ"]
+    timeframe: "D"
+    capital_allocation_pct: 20
+    use_paper: true  # cambiar a false para live
+
+indicators:
+  rsi_period: 14
+  ema_fast: 9
+  ema_slow: 21
+  ema_trend: 50
+  ema_trend_long: 200
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  volume_multiplier: 1.5
+  volume_lookback: 20
+  min_signals_for_entry: 3  # de 4 indicadores
+
+position_management:
+  stop_loss_pct: 2.0
+  take_profit_1_pct: 3.0
+  take_profit_1_close_pct: 50
+  take_profit_2_pct: 6.0
+  trailing_stop_pct: 1.5
+  trailing_stop_activation: after_tp1
+  max_position_size_pct: 20
+
+scheduler:
+  scanner_interval_minutes: 5
+  health_check_interval_minutes: 60
+  partial_report_interval_hours: 4
+  daily_report_time: "22:00"
+  weekly_report_day: "friday"
+  weekly_report_time: "20:00"
+  timezone: "GMT"
+
+telegram:
+  send_signals: true
+  send_executions: true
+  send_sl_tp_hits: true
+  send_daily_reports: true
+  send_weekly_reports: true
+
+initial_capital_gbp: 1000

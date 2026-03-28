@@ -1,0 +1,1 @@
+"""Equity curve chart component."""
