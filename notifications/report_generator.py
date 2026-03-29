@@ -146,15 +146,33 @@ def generate_partial_report() -> str:
     today = now.strftime("%Y-%m-%d")
     daily_pnl = get_daily_pnl(today)
     open_count = count_open_trades()
-    total_pnl = get_total_pnl()
+    realized_pnl = get_total_pnl()
 
-    pnl_emoji = "\U0001f4b5" if daily_pnl >= 0 else "\U0001f4b8"
+    # Include unrealized PnL from open positions
+    unrealized_pnl = 0.0
+    try:
+        from execution.position_manager import get_unrealized_pnl
+        from data.database import get_open_trades as _get_open
+        for t in _get_open():
+            try:
+                upnl = get_unrealized_pnl(t)
+                unrealized_pnl += upnl["unrealized_pnl_gbp"]
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    return (
-        f"{pnl_emoji} <b>Update {now.strftime('%H:%M UTC')}</b>\n"
+    total_pnl = realized_pnl + unrealized_pnl
+    pnl_emoji = "\U0001f4b5" if total_pnl >= 0 else "\U0001f4b8"
+
+    text = f"{pnl_emoji} <b>Update {now.strftime('%H:%M UTC')}</b>\n"
+    if open_count > 0 and unrealized_pnl != 0:
+        text += f"PnL abierto: GBP {unrealized_pnl:+,.2f} | "
+    text += (
         f"PnL hoy: GBP {daily_pnl:+,.2f} | Total: GBP {total_pnl:+,.2f} | "
         f"Abiertas: {open_count}"
     )
+    return text
 
 
 def send_daily_report() -> None:

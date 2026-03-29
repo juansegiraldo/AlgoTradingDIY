@@ -1,5 +1,5 @@
 risk_policies:
-  max_loss_per_trade_pct: 5
+  max_loss_per_trade_pct: 1
   max_loss_daily_pct: 10
   max_loss_weekly_pct: 20
   max_drawdown_total_pct: 50

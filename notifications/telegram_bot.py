@@ -38,6 +38,8 @@ from data.database import (
     log_info,
     log_warning,
 )
+# NOTE: execution.position_manager is imported lazily inside cmd_close/cmd_closeall/callback_handler
+# to avoid circular imports (position_manager imports telegram_bot for notifications)
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +87,11 @@ def format_signal_alert(signal: dict) -> str:
         f"\n"
         f"\U0001f4b0 <b>Entrada:</b> {signal['entry_price']:,.2f}\n"
         f"\U0001f6d1 <b>Stop-Loss:</b> {signal['stop_loss']:,.2f}\n"
-        f"\U0001f3af <b>TP1:</b> {signal.get('take_profit_1', 'N/A')}\n"
-        f"\U0001f3af <b>TP2:</b> {signal.get('take_profit_2', 'N/A')}\n"
+        f"\U0001f3af <b>TP1:</b> {float(signal['take_profit_1']):,.2f}\n"
+        f"\U0001f3af <b>TP2:</b> {float(signal['take_profit_2']):,.2f}\n"
         f"\n"
-        f"\U0001f4ca <b>Tamano:</b> {signal['position_size']}\n"
-        f"\U000026a0 <b>Riesgo:</b> GBP {signal.get('risk_gbp', '?')} ({signal.get('risk_pct', '?')}%)\n"
+        f"\U0001f4ca <b>Tamano:</b> {float(signal['position_size']):.6f}\n"
+        f"\U000026a0 <b>Riesgo:</b> GBP {float(signal.get('risk_gbp', 0)):.1f} ({float(signal.get('risk_pct', 0)):.1f}%)\n"
         f"\U0001f4aa <b>Apalancamiento:</b> {signal.get('leverage', 1)}x\n"
         f"\U0001f4c8 <b>Mercado:</b> {signal.get('market', 'N/A')}\n"
         f"\n"
@@ -146,7 +148,7 @@ def format_close_notification(trade: dict) -> str:
 def format_portfolio_status() -> str:
     equity = get_latest_equity()
     open_count = count_open_trades()
-    total_pnl = get_total_pnl()
+    realized_pnl = get_total_pnl()
     win_rate = get_win_rate()
 
     if equity:
@@ -156,16 +158,44 @@ def format_portfolio_status() -> str:
 
     wr_text = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
 
-    return (
+    # Calculate unrealized PnL from open positions
+    unrealized_pnl = 0.0
+    try:
+        from execution.position_manager import get_unrealized_pnl
+        for t in get_open_trades():
+            try:
+                upnl = get_unrealized_pnl(t)
+                unrealized_pnl += upnl["unrealized_pnl_gbp"]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    total_pnl = realized_pnl + unrealized_pnl
+
+    text = (
         f"\U0001f4ca <b>PORTFOLIO STATUS</b>\n"
         f"\n"
         f"\U0001f4b0 Capital: GBP {capital:,.2f}\n"
-        f"\U0001f4c8 PnL Total: GBP {total_pnl:+,.2f}\n"
+    )
+
+    if open_count > 0:
+        unr_emoji = "\U0001f4c8" if unrealized_pnl >= 0 else "\U0001f4c9"
+        text += f"{unr_emoji} PnL Abierto: GBP {unrealized_pnl:+,.2f}\n"
+
+    if realized_pnl != 0:
+        text += f"\U0001f4b5 PnL Cerrado: GBP {realized_pnl:+,.2f}\n"
+
+    pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
+    text += (
+        f"{pnl_emoji} PnL Total: GBP {total_pnl:+,.2f}\n"
         f"\U0001f3af Win Rate: {wr_text}\n"
         f"\U0001f4cb Posiciones abiertas: {open_count}\n"
         f"\n"
         f"\U0001f552 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
+
+    return text
 
 
 def format_open_positions() -> str:
@@ -173,14 +203,63 @@ def format_open_positions() -> str:
     if not trades:
         return "\U0001f4ad <b>Sin posiciones abiertas</b>"
 
-    lines = ["\U0001f4cb <b>POSICIONES ABIERTAS</b>\n"]
-    for t in trades:
+    GBP_PER_USDT = 1.0 / 1.27
+    lines = [f"\U0001f4cb <b>POSICIONES ABIERTAS ({len(trades)})</b>"]
+    total_invested = 0.0
+    total_pnl = 0.0
+
+    for i, t in enumerate(trades, 1):
         direction_emoji = "\U0001f7e2" if t["direction"] == "long" else "\U0001f534"
+        entry = float(t["entry_price"])
+        size = float(t["position_size"])
+        leverage = float(t.get("leverage") or 1)
+        sl = float(t["stop_loss"])
+        tp1 = float(t["take_profit_1"]) if t.get("take_profit_1") else None
+
+        # Margin = what you actually "put in"
+        notional_usd = size * entry
+        margin_gbp = (notional_usd / leverage) * GBP_PER_USDT
+        total_invested += margin_gbp
+
+        # Unrealized PnL
+        pnl_line = ""
+        try:
+            from execution.position_manager import get_unrealized_pnl
+            upnl = get_unrealized_pnl(t)
+            current_price = upnl["current_price"]
+            gbp = upnl["unrealized_pnl_gbp"]
+            total_pnl += gbp
+            pnl_emoji = "\U0001f7e2" if gbp >= 0 else "\U0001f534"
+            sign = "+" if gbp >= 0 else ""
+            pnl_line = f"   {pnl_emoji} <b>{sign}{gbp:.2f} GBP</b> | Ahora: ${current_price:,.2f}\n"
+        except Exception:
+            pass
+
+        # Distance to SL and TP1
+        if t["direction"] == "long":
+            sl_dist = ((sl - entry) / entry) * 100
+            tp1_dist = (((tp1 - entry) / entry) * 100) if tp1 else None
+        else:
+            sl_dist = ((entry - sl) / entry) * -100
+            tp1_dist = (((entry - tp1) / entry) * 100) if tp1 else None
+
+        tp_text = f" | \U0001f3af TP1: {tp1_dist:+.1f}%" if tp1_dist is not None else ""
+
         lines.append(
-            f"{direction_emoji} <b>{t['pair']}</b> {t['direction'].upper()} "
-            f"@ {t['entry_price']:,.2f} | SL: {t['stop_loss']:,.2f} | "
-            f"Lev: {t.get('leverage', 1)}x"
+            f"\n{i}. {direction_emoji} <b>{t['pair']} {t['direction'].upper()}</b> ({leverage:.0f}x)\n"
+            f"   \U0001f4b0 Invertido: GBP {margin_gbp:,.2f}\n"
+            f"{pnl_line}"
+            f"   \U0001f6d1 SL: {sl_dist:+.1f}%{tp_text}"
         )
+
+    # Summary
+    total_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+    sign = "+" if total_pnl >= 0 else ""
+    lines.append(
+        f"\n{'=' * 24}\n"
+        f"\U0001f4b0 Total invertido: GBP {total_invested:,.2f}\n"
+        f"{total_emoji} PnL total: <b>{sign}{total_pnl:.2f} GBP</b>"
+    )
     return "\n".join(lines)
 
 
@@ -242,12 +321,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/force - Comprar YA (ej: /force btc, /force eth, /force sol short)\n"
         "/test - Trade de prueba con GO/SKIP\n"
         "/scan - Escanear mercados ahora\n"
+        "/close - Ver posiciones con boton Cerrar por trade\n"
+        "/close 5 - Cerrar trade #5 directamente\n"
+        "/closeall - Cerrar TODAS las posiciones (pide confirmacion)\n"
         "/pause - Pausar todo el sistema\n"
         "/resume - Reanudar el sistema\n"
         "/help - Este mensaje\n\n"
         "<b>Alertas de trading:</b>\n"
         "Cuando se detecte una senal, recibiras un mensaje con botones "
         "<b>GO</b> (ejecutar) o <b>SKIP</b> (ignorar).\n\n"
+        "<b>Proteccion automatica:</b>\n"
+        "El bot revisa cada 30s si alguna posicion toco su SL o TP.\n"
+        "Si tocas /close puedes cerrar manualmente en cualquier momento.\n\n"
         "<i>Modo actual: {mode}</i>".format(
             mode=get_settings().get("mode", "paper").upper()
         ),
@@ -334,33 +419,65 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force buy immediately — no rules, no confirmation. Just buy."""
+    """Show asset info, suggest sizes, let user pick with buttons."""
     args = (context.args or [])
     pair = args[0].upper() if args else "BTC/USDT"
-    # Normalize: "btc" -> "BTC/USDT"
     if "/" not in pair:
         pair = pair + "/USDT"
 
     direction = "long"
-    if len(args) > 1 and args[1].lower() in ("short", "sell"):
+    if len(args) > 1 and args[1].lower() in ("short", "sell", "s"):
         direction = "short"
 
     await update.message.reply_text(
-        f"\U0001f525 <b>FORCE {direction.upper()} {pair}...</b>",
+        f"\U0001f50e <b>Analizando {pair}...</b>",
         parse_mode="HTML",
     )
 
     try:
-        from execution.binance_executor import fetch_price
-        from risk.position_sizer import enrich_signal_with_sizing
-        from pipeline import execute_signal
+        from execution.binance_executor import fetch_price, fetch_ohlcv
+        from signals.indicators import ohlcv_to_dataframe, analyze
+        from risk.position_sizer import calculate_position
         from data.database import get_latest_equity, save_equity_snapshot
+        import uuid
 
         if not get_latest_equity():
             save_equity_snapshot(total_capital=get_settings().get("initial_capital_gbp", 1000))
 
         price = fetch_price(pair)
 
+        # Get indicators
+        ohlcv = fetch_ohlcv(pair, "1h", limit=100)
+        df = ohlcv_to_dataframe(ohlcv)
+        analysis = analyze(df)
+        rsi = analysis["rsi"]
+        ema = analysis["ema"]
+        macd = analysis["macd"]
+        vol = analysis["volume"]
+        trend = analysis["trend"]
+
+        # 24h change
+        ohlcv_24h = fetch_ohlcv(pair, "1d", limit=2)
+        if ohlcv_24h and len(ohlcv_24h) >= 2:
+            prev_close = ohlcv_24h[-2][4]
+            change_24h = ((price - prev_close) / prev_close) * 100
+        else:
+            change_24h = 0
+
+        # Indicator icons
+        rsi_icon = "\u2705" if rsi["triggered"] else "\u26aa"
+        ema_icon = "\u2705" if ema["triggered"] else "\u26aa"
+        macd_icon = "\u2705" if macd["triggered"] else "\u26aa"
+        vol_icon = "\u2705" if vol["triggered"] else "\u26aa"
+        vol_ratio = vol.get("value", {}).get("ratio", 0)
+        trend_icon = {
+            "bullish": "\U0001f7e2 ALCISTA",
+            "bearish": "\U0001f534 BAJISTA",
+            "mixed": "\U0001f7e1 MIXTA",
+        }.get(trend.get("trend"), "\u26aa DESCONOCIDA")
+        change_icon = "\U0001f4c8" if change_24h >= 0 else "\U0001f4c9"
+
+        # Calculate 3 position sizes
         if direction == "long":
             sl = round(price * 0.98, 2)
             tp1 = round(price * 1.03, 2)
@@ -370,45 +487,92 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             tp1 = round(price * 0.97, 2)
             tp2 = round(price * 0.94, 2)
 
-        signal = {
-            "pair": pair,
-            "timeframe": "manual",
-            "market": "crypto",
-            "direction": direction,
-            "entry_price": price,
-            "stop_loss": sl,
-            "take_profit_1": tp1,
-            "take_profit_2": tp2,
-            "leverage": 5,
-            "signal_count": 4,
-            "min_required": 3,
+        # Conservative (5% risk - R1 compliant)
+        size_safe = calculate_position(pair, direction, price, sl, "crypto", 5)
+        # Medium (15% risk)
+        size_med = calculate_position(pair, direction, price, sl, "crypto", 10)
+        # All-in (entire crypto allocation)
+        eq = get_latest_equity()
+        capital = eq["total_capital"] if eq else 1000
+        crypto_capital = capital * 0.5
+        allin_value = crypto_capital * 20  # max leverage
+        allin_size = round((allin_value * 1.27) / price, 8)
+
+        dir_emoji = "\U0001f7e2" if direction == "long" else "\U0001f534"
+
+        info_text = (
+            f"{dir_emoji} <b>{pair} — {direction.upper()}</b>\n"
+            f"\n"
+            f"\U0001f4b0 <b>Precio:</b> ${price:,.2f}\n"
+            f"{change_icon} <b>24h:</b> {change_24h:+.2f}%\n"
+            f"\U0001f4c8 <b>Tendencia:</b> {trend_icon}\n"
+            f"\n"
+            f"<b>Indicadores (1h):</b>\n"
+            f"  {rsi_icon} RSI: {rsi.get('value', 'N/A')}\n"
+            f"  {ema_icon} EMA 9/21: {'cruce ' + (ema.get('signal') or 'sin cruce').upper() if ema.get('signal') else 'sin cruce'}\n"
+            f"  {macd_icon} MACD: {'cruce ' + (macd.get('signal') or 'sin cruce').upper() if macd.get('signal') else 'sin cruce'}\n"
+            f"  {vol_icon} Volumen: {vol_ratio}x vs promedio\n"
+            f"\n"
+            f"\U0001f6d1 <b>Stop-Loss:</b> ${sl:,.2f} (-2%)\n"
+            f"\U0001f3af <b>TP1:</b> ${tp1:,.2f} (+3%) | <b>TP2:</b> ${tp2:,.2f} (+6%)\n"
+            f"\n"
+            f"<b>Elige tamano:</b>"
+        )
+
+        # Build signal for each size option
+        base_signal = {
+            "pair": pair, "timeframe": "manual", "market": "crypto",
+            "direction": direction, "entry_price": price,
+            "stop_loss": sl, "take_profit_1": tp1, "take_profit_2": tp2,
+            "signal_count": 4, "min_required": 3,
             "signals_triggered": {"manual": True},
-            "trend": "forced",
-            "strength": "manual",
+            "trend": trend.get("trend", "unknown"), "strength": "manual",
         }
 
-        signal = enrich_signal_with_sizing(signal)
-        result = execute_signal(signal)
+        # Store signals for each button
+        id_safe = f"force_safe_{uuid.uuid4().hex[:6]}"
+        id_med = f"force_med_{uuid.uuid4().hex[:6]}"
+        id_allin = f"force_allin_{uuid.uuid4().hex[:6]}"
 
-        if result.get("success"):
-            entry = result.get("entry_price", price)
-            mode = get_settings().get("mode", "paper").upper()
-            await update.message.reply_text(
-                f"\u2705 <b>COMPRADO ({mode})</b>\n\n"
-                f"\U0001f4c4 {pair} {direction.upper()}\n"
-                f"\U0001f4b0 Entrada: ${entry:,.2f}\n"
-                f"\U0001f6d1 SL: ${sl:,.2f}\n"
-                f"\U0001f3af TP1: ${tp1:,.2f} | TP2: ${tp2:,.2f}\n"
-                f"\U0001f4ca Size: {signal['position_size']:.6f}\n"
-                f"\U0001f4aa Leverage: 5x\n"
-                f"\U0001f3f7 Trade #{result.get('trade_id')}",
-                parse_mode="HTML",
-            )
-        else:
-            await update.message.reply_text(
-                f"\u274c <b>Error:</b> {result.get('error')}",
-                parse_mode="HTML",
-            )
+        sig_safe = {**base_signal, "leverage": 5, **size_safe}
+        sig_med = {**base_signal, "leverage": 10, **size_med}
+        sig_allin = {
+            **base_signal, "leverage": 20,
+            "position_size": allin_size,
+            "position_size_value": crypto_capital,
+            "risk_gbp": crypto_capital,
+            "risk_pct": 50,
+        }
+
+        _pending_signals[id_safe] = sig_safe
+        _pending_signals[id_med] = sig_med
+        _pending_signals[id_allin] = sig_allin
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    f"\u2705 Seguro — {size_safe['position_size']:.4f} (GBP {size_safe['risk_amount']:.0f} riesgo)",
+                    callback_data=f"go:{id_safe}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"\U0001f525 Medio — {size_med['position_size']:.4f} (GBP {size_med['risk_amount']:.0f} riesgo)",
+                    callback_data=f"go:{id_med}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"\u26a0 ALL-IN — {allin_size:.4f} (GBP {crypto_capital:.0f} TODO)",
+                    callback_data=f"go:{id_allin}",
+                ),
+            ],
+            [
+                InlineKeyboardButton("\u23ed No comprar", callback_data=f"skip:{id_safe}"),
+            ],
+        ])
+
+        await update.message.reply_text(info_text, parse_mode="HTML", reply_markup=keyboard)
 
     except Exception as e:
         await update.message.reply_text(
@@ -449,8 +613,144 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Close a specific trade by ID, or show open positions with Cerrar buttons."""
+    from execution.position_manager import close_trade_manual, get_unrealized_pnl
+
+    args = context.args or []
+
+    if args:
+        # Close a specific trade by ID
+        try:
+            trade_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "\u274c <b>ID invalido.</b> Usa <code>/close 5</code> con el numero de trade.",
+                parse_mode="HTML",
+            )
+            return
+
+        await update.message.reply_text(
+            f"\u23f3 <b>Cerrando trade #{trade_id}...</b>",
+            parse_mode="HTML",
+        )
+        try:
+            result = close_trade_manual(trade_id)
+            if not result or not result.get("success"):
+                error = result.get("error", "Trade no encontrado o ya cerrado") if result else "Error desconocido"
+                await update.message.reply_text(
+                    f"\u274c <b>#{trade_id}:</b> {error}",
+                    parse_mode="HTML",
+                )
+                return
+
+            pnl = result.get("pnl_gbp", 0)
+            pnl_pct = result.get("pnl_pct", 0)
+            pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
+            sign = "+" if pnl >= 0 else ""
+            direction_emoji = "\U0001f7e2" if result.get("direction") == "long" else "\U0001f534"
+
+            await update.message.reply_text(
+                f"{pnl_emoji} <b>TRADE CERRADO</b>\n"
+                f"\n"
+                f"{direction_emoji} <b>{result['pair']} {result.get('direction', '').upper()}</b>\n"
+                f"\U0001f4b0 Entrada: {result.get('entry_price', 0):,.2f}\n"
+                f"\U0001f3c1 Salida: {result.get('exit_price', 0):,.2f}\n"
+                f"\n"
+                f"PnL: <b>{sign}{pnl:.2f} GBP ({sign}{pnl_pct:.1f}%)</b>",
+                parse_mode="HTML",
+            )
+            log_info("telegram", f"Trade #{trade_id} closed manually via /close command")
+        except Exception as e:
+            logger.error(f"Error closing trade #{trade_id}: {e}")
+            await update.message.reply_text(
+                f"\u274c <b>Error al cerrar trade #{trade_id}:</b> {e}",
+                parse_mode="HTML",
+            )
+        return
+
+    # No ID given — show all open positions with Cerrar buttons
+    trades = get_open_trades()
+    if not trades:
+        await update.message.reply_text(
+            "\U0001f4ad <b>Sin posiciones abiertas.</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = ["\U0001f4cb <b>POSICIONES ABIERTAS</b>\n"]
+    keyboard_rows = []
+
+    for i, t in enumerate(trades, start=1):
+        trade_id = t["id"]
+        direction_emoji = "\U0001f7e2" if t["direction"] == "long" else "\U0001f534"
+
+        try:
+            upnl = get_unrealized_pnl(t)
+            upnl_gbp = upnl["unrealized_pnl_gbp"]
+            upnl_emoji = "\U0001f7e2" if upnl_gbp >= 0 else "\U0001f534"
+            sign = "+" if upnl_gbp >= 0 else ""
+            upnl_text = f" | PnL: {upnl_emoji} {sign}{upnl_gbp:.2f} GBP"
+        except Exception:
+            upnl_text = ""
+
+        lines.append(
+            f"{i}. {direction_emoji} <b>{t['pair']}</b> {t['direction'].upper()} "
+            f"@ {t['entry_price']:,.2f} | SL: {t['stop_loss']:,.2f} | "
+            f"Lev: {t.get('leverage', 1)}x{upnl_text}"
+        )
+        keyboard_rows.append(
+            [InlineKeyboardButton(
+                f"\U0001f6aa Cerrar #{trade_id} {t['pair']}",
+                callback_data=f"close:{trade_id}",
+            )]
+        )
+
+    keyboard_rows.append(
+        [InlineKeyboardButton("\u26d4 Cerrar TODAS", callback_data="closeall:confirm_pre")]
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+    )
+
+
+async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation before closing all open trades."""
+    from execution.position_manager import close_all_trades  # noqa: F811
+    trades = get_open_trades()
+    if not trades:
+        await update.message.reply_text(
+            "\U0001f4ad <b>Sin posiciones abiertas.</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    count = len(trades)
+    pairs = ", ".join(t["pair"] for t in trades)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\u2705 Si, cerrar todo", callback_data="closeall:confirm"),
+            InlineKeyboardButton("\u274c No, cancelar", callback_data="closeall:cancel"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"\u26a0 <b>Confirmar cierre total</b>\n"
+        f"\n"
+        f"Vas a cerrar <b>{count} posicion(es)</b>:\n"
+        f"<code>{pairs}</code>\n"
+        f"\n"
+        f"\u26a0 Esta accion no se puede deshacer.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Callback (GO / SKIP buttons)
+# Callback (GO / SKIP / CLOSE buttons)
 # ---------------------------------------------------------------------------
 
 
@@ -458,9 +758,157 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # e.g. "go:signal_123" or "skip:signal_123"
-    action, signal_id = data.split(":", 1)
+    data = query.data  # e.g. "go:signal_123", "close:42", "closeall:confirm"
+    action, payload = data.split(":", 1)
 
+    # Lazy imports to avoid circular dependency with position_manager
+    from execution.position_manager import close_trade_manual, close_all_trades
+
+    # ------------------------------------------------------------------
+    # close:{trade_id} — close a single trade from the /close keyboard
+    # ------------------------------------------------------------------
+    if action == "close":
+        try:
+            trade_id = int(payload)
+        except ValueError:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(
+                "\u274c ID de trade invalido.", parse_mode="HTML"
+            )
+            return
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"\u23f3 <b>Cerrando trade #{trade_id}...</b>",
+            parse_mode="HTML",
+        )
+        try:
+            result = close_trade_manual(trade_id)
+            if not result or not result.get("success"):
+                error = result.get("error", "Trade no encontrado o ya cerrado") if result else "Error desconocido"
+                await query.message.reply_text(
+                    f"\u274c <b>#{trade_id}:</b> {error}",
+                    parse_mode="HTML",
+                )
+                return
+
+            pnl = result.get("pnl_gbp", 0)
+            pnl_pct = result.get("pnl_pct", 0)
+            pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
+            sign = "+" if pnl >= 0 else ""
+            direction_emoji = "\U0001f7e2" if result.get("direction") == "long" else "\U0001f534"
+
+            await query.message.reply_text(
+                f"{pnl_emoji} <b>TRADE CERRADO</b>\n"
+                f"\n"
+                f"{direction_emoji} <b>{result['pair']} {result.get('direction', '').upper()}</b>\n"
+                f"\U0001f4b0 Entrada: {result.get('entry_price', 0):,.2f}\n"
+                f"\U0001f3c1 Salida: {result.get('exit_price', 0):,.2f}\n"
+                f"\n"
+                f"PnL: <b>{sign}{pnl:.2f} GBP ({sign}{pnl_pct:.1f}%)</b>",
+                parse_mode="HTML",
+            )
+            log_info("telegram", f"Trade #{trade_id} closed manually via inline button")
+        except Exception as e:
+            logger.error(f"Error closing trade #{trade_id} via callback: {e}")
+            await query.message.reply_text(
+                f"\u274c <b>Error al cerrar trade #{trade_id}:</b> {e}",
+                parse_mode="HTML",
+            )
+        return
+
+    # ------------------------------------------------------------------
+    # closeall:confirm_pre — from /close keyboard, redirect to confirmation
+    # ------------------------------------------------------------------
+    if action == "closeall" and payload == "confirm_pre":
+        trades = get_open_trades()
+        count = len(trades)
+        pairs = ", ".join(t["pair"] for t in trades) if trades else "ninguna"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\u2705 Si, cerrar todo", callback_data="closeall:confirm"),
+                InlineKeyboardButton("\u274c No, cancelar", callback_data="closeall:cancel"),
+            ]
+        ])
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"\u26a0 <b>Confirmar cierre total</b>\n"
+            f"\n"
+            f"Vas a cerrar <b>{count} posicion(es)</b>:\n"
+            f"<code>{pairs}</code>\n"
+            f"\n"
+            f"\u26a0 Esta accion no se puede deshacer.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # closeall:confirm / closeall:cancel
+    # ------------------------------------------------------------------
+    if action == "closeall":
+        if payload == "cancel":
+            await query.edit_message_text(
+                text=query.message.text_html + "\n\n\u274c <b>Cancelado.</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        if payload == "confirm":
+            await query.edit_message_text(
+                text=query.message.text_html + "\n\n\u23f3 <b>Cerrando todas las posiciones...</b>",
+                parse_mode="HTML",
+            )
+            try:
+                results = close_all_trades()
+                if not results:
+                    await query.message.reply_text(
+                        "\U0001f4ad <b>Sin posiciones abiertas para cerrar.</b>",
+                        parse_mode="HTML",
+                    )
+                    return
+
+                total_pnl = sum(r.get("pnl_gbp", 0) for r in results if r.get("success"))
+                total_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+                sign = "+" if total_pnl >= 0 else ""
+
+                lines = [f"\u26d4 <b>CIERRE TOTAL — {len(results)} posicion(es)</b>\n"]
+                for r in results:
+                    if not r.get("success"):
+                        lines.append(f"\u274c #{r.get('trade_id')} {r.get('pair', '?')} - Error: {r.get('error', '?')}")
+                        continue
+                    pnl = r.get("pnl_gbp", 0)
+                    pnl_pct = r.get("pnl_pct", 0)
+                    pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
+                    r_sign = "+" if pnl >= 0 else ""
+                    direction_emoji = "\U0001f7e2" if r.get("direction") == "long" else "\U0001f534"
+                    lines.append(
+                        f"{direction_emoji} <b>{r['pair']}</b> {r.get('direction', '').upper()} "
+                        f"@ {r.get('entry_price', 0):,.2f} -> {r.get('exit_price', 0):,.2f} | "
+                        f"{pnl_emoji} {r_sign}{pnl:.2f} GBP ({r_sign}{pnl_pct:.1f}%)"
+                    )
+
+                lines.append(
+                    f"\n{total_emoji} <b>PnL total: {sign}{total_pnl:.2f} GBP</b>"
+                )
+                await query.message.reply_text(
+                    "\n".join(lines),
+                    parse_mode="HTML",
+                )
+                log_info("telegram", f"All trades closed manually via Telegram. Count: {len(results)}")
+            except Exception as e:
+                logger.error(f"Error closing all trades via callback: {e}")
+                await query.message.reply_text(
+                    f"\u274c <b>Error al cerrar todas las posiciones:</b> {e}",
+                    parse_mode="HTML",
+                )
+        return
+
+    # ------------------------------------------------------------------
+    # go / skip — existing signal confirmation logic
+    # ------------------------------------------------------------------
+    signal_id = payload
     signal = _pending_signals.pop(signal_id, None)
     if signal is None:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -600,6 +1048,8 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("scan", cmd_scan))
     _app.add_handler(CommandHandler("pause", cmd_pause))
     _app.add_handler(CommandHandler("resume", cmd_resume))
+    _app.add_handler(CommandHandler("close", cmd_close))
+    _app.add_handler(CommandHandler("closeall", cmd_closeall))
     _app.add_handler(CommandHandler("help", cmd_help))
     _app.add_handler(CallbackQueryHandler(callback_handler))
     return _app

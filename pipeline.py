@@ -33,7 +33,6 @@ from data.database import (
     count_open_trades,
 )
 from signals.scanner import scan_all
-from signals.signal_generator import format_signal_for_telegram
 from risk.position_sizer import enrich_signal_with_sizing
 from risk.risk_manager import validate_trade
 from risk.circuit_breaker import run_checks as run_circuit_breaker_checks
@@ -237,13 +236,9 @@ def _send_alert(signal: dict, signal_id: str) -> None:
     """Send a trade alert with GO/SKIP buttons."""
     try:
         from notifications.telegram_bot import send_signal_alert_sync
-        telegram_signal = format_signal_for_telegram(
-            signal,
-            risk_gbp=signal.get("risk_gbp", 0),
-            risk_pct=signal.get("risk_pct", 0),
-            position_size=f"{signal.get('position_size', 0):.6f}",
-        )
-        send_signal_alert_sync(telegram_signal, signal_id)
+        # Pass the original signal (with numeric values) so the GO callback
+        # can execute it correctly.  format_signal_alert() handles display.
+        send_signal_alert_sync(signal, signal_id)
     except Exception as e:
         logger.error(f"Failed to send Telegram alert: {e}")
 
