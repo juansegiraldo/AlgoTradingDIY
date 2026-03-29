@@ -1,4 +1,10 @@
-"""Configuration loader - reads YAML files and provides access to settings."""
+"""Configuration loader - reads YAML files and provides access to settings.
+
+Secrets priority:
+  1. Environment variables (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+     BINANCE_API_KEY, BINANCE_API_SECRET)
+  2. config/secrets.yaml (fallback for local dev)
+"""
 
 import os
 from pathlib import Path
@@ -21,8 +27,32 @@ def load_settings() -> dict:
     return _load_yaml("settings.yaml")
 
 
+def _load_secrets_with_env_override() -> dict:
+    """Load secrets.yaml then override with env vars if present."""
+    try:
+        secrets = _load_yaml("secrets.yaml")
+    except FileNotFoundError:
+        secrets = {}
+
+    # Ensure nested dicts exist
+    secrets.setdefault("telegram", {})
+    secrets.setdefault("binance_testnet", {})
+
+    # Environment variable overrides
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        secrets["telegram"]["bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+    if os.environ.get("TELEGRAM_CHAT_ID"):
+        secrets["telegram"]["chat_id"] = os.environ["TELEGRAM_CHAT_ID"]
+    if os.environ.get("BINANCE_API_KEY"):
+        secrets["binance_testnet"]["api_key"] = os.environ["BINANCE_API_KEY"]
+    if os.environ.get("BINANCE_API_SECRET"):
+        secrets["binance_testnet"]["api_secret"] = os.environ["BINANCE_API_SECRET"]
+
+    return secrets
+
+
 def load_secrets() -> dict:
-    return _load_yaml("secrets.yaml")
+    return _load_secrets_with_env_override()
 
 
 def load_risk_policies() -> dict:

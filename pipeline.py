@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 _approved_signals: dict[str, dict] = {}  # signal_id -> enriched signal
 
 
+def _is_system_paused() -> bool:
+    """Check if the system is paused (reads from DB flag, not cached YAML)."""
+    from data.database import get_system_flag
+    return get_system_flag("paused") == "true"
+
+
 # ---------------------------------------------------------------------------
 # Step 1-4: Scan → Size → Validate → Alert
 # ---------------------------------------------------------------------------
@@ -61,7 +67,7 @@ def run_scan_cycle() -> list[dict]:
     settings = get_settings()
     mode = settings.get("mode", "paper")
 
-    if mode == "pause":
+    if mode == "pause" or _is_system_paused():
         log_info("pipeline", "System PAUSED — skipping scan cycle")
         return []
 
@@ -146,6 +152,11 @@ def execute_signal(signal: dict) -> dict:
     market = signal.get("market", "crypto")
     mode = get_settings().get("mode", "paper")
 
+    if _is_system_paused():
+        log_warning("pipeline", f"Execution blocked: system is paused ({pair})")
+        _notify_error(signal, "System is PAUSED — execution blocked")
+        return {"success": False, "error": "System is paused"}
+
     log_info("pipeline", f"Executing: {pair} {signal['direction'].upper()} ({mode})")
 
     try:
@@ -222,8 +233,45 @@ def _execute_on_broker(signal: dict, market: str) -> dict:
 
 
 def on_go_callback(signal: dict) -> None:
-    """Called when user taps GO on a Telegram alert."""
-    log_info("pipeline", f"User confirmed GO: {signal.get('pair')} {signal.get('direction')}")
+    """Called when user taps GO on a Telegram alert.
+
+    Re-validates risk policies and circuit breakers before executing,
+    since conditions may have changed since the signal was approved.
+    """
+    pair = signal.get("pair", "?")
+    direction = signal.get("direction", "?")
+    log_info("pipeline", f"User confirmed GO: {pair} {direction}")
+
+    # Check system pause
+    if _is_system_paused():
+        log_warning("pipeline", f"GO rejected: system is paused ({pair} {direction})")
+        _notify_rejection(signal, {"rejection_reasons": ["System is PAUSED"]})
+        return
+
+    # Re-check circuit breaker
+    cb = run_circuit_breaker_checks()
+    if cb:
+        log_warning("pipeline", f"GO rejected: circuit breaker active ({pair} {direction})")
+        _notify_circuit_breaker(cb)
+        return
+
+    # Re-validate risk policies (sizing may need refresh if capital changed)
+    signal = enrich_signal_with_sizing(signal)
+    if not signal.get("sizing_approved", False):
+        log_warning("pipeline", f"GO rejected: sizing failed on revalidation ({pair})")
+        _notify_rejection(signal, {"rejection_reasons": [signal.get("sizing_reason", "Sizing rejected")]})
+        return
+
+    validation = validate_trade(signal)
+    if not validation["approved"]:
+        log_warning(
+            "pipeline",
+            f"GO rejected on revalidation: {pair} {direction} — "
+            + "; ".join(validation["rejection_reasons"]),
+        )
+        _notify_rejection(signal, validation)
+        return
+
     execute_signal(signal)
 
 

@@ -45,6 +45,7 @@ from notifications.report_generator import (
     send_partial_report,
 )
 from execution.binance_executor import health_check as binance_health_check
+from execution.position_manager import check_open_positions
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Scheduled task wrappers
 # ---------------------------------------------------------------------------
+
+
+def scheduled_position_check():
+    """Check open positions for SL/TP hits (called by APScheduler every 30s)."""
+    try:
+        check_open_positions()
+    except Exception as e:
+        logger.error(f"Position check error: {e}", exc_info=True)
+        log_info("scheduler", f"Position check error: {e}")
 
 
 def scheduled_scan():
@@ -190,6 +200,15 @@ async def main():
     # 3. Setup APScheduler
     scheduler = AsyncIOScheduler(timezone="UTC")
     sched_cfg = settings.get("scheduler", {})
+
+    # Position monitor: every 30 seconds (checks SL/TP hits)
+    scheduler.add_job(
+        scheduled_position_check,
+        IntervalTrigger(seconds=30),
+        id="position_monitor",
+        name="Position Monitor (SL/TP)",
+        max_instances=1,
+    )
 
     # Scanner: every N minutes
     scheduler.add_job(

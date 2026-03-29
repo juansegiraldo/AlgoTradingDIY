@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.loader import get_secrets, get_settings
-from data.database import log_info, log_error, log_warning
+from data.database import log_info, log_error, log_warning, get_open_trades, get_total_pnl
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +203,38 @@ def _paper_stop_order(pair: str, side: str, amount: float, stop_price: float, or
 # ---------------------------------------------------------------------------
 
 
+def _paper_balance_from_db() -> dict:
+    """Calculate paper balance from DB (source of truth, survives restarts)."""
+    capital_gbp = get_settings().get("initial_capital_gbp", 1000)
+    crypto_pct = get_settings()["markets"]["crypto"].get("capital_allocation_pct", 50)
+    GBP_TO_USDT = 1.27
+    usdt_capital = capital_gbp * (crypto_pct / 100.0) * GBP_TO_USDT
+
+    margin_used = 0.0
+    realized_pnl_usdt = 0.0
+    try:
+        for t in get_open_trades():
+            entry = float(t["entry_price"])
+            size = float(t["position_size"])
+            leverage = float(t.get("leverage") or 1)
+            margin_used += size * entry / leverage
+        realized_pnl_usdt = get_total_pnl() * GBP_TO_USDT
+    except Exception:
+        pass
+
+    total = usdt_capital + realized_pnl_usdt
+    free = total - margin_used
+
+    return {
+        "USDT": {"free": round(free, 2), "used": round(margin_used, 2), "total": round(total, 2)}
+    }
+
+
 def fetch_balance() -> dict:
-    """Get account balance."""
+    """Get account balance (paper: from DB, live: from Binance)."""
     if _is_paper_mode():
         _init_paper()
-        return _paper_balance
+        return _paper_balance_from_db()
     exchange = get_exchange()
     balance = exchange.fetch_balance()
     relevant = {}

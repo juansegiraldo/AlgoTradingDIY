@@ -23,16 +23,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.loader import get_risk_policies, get_settings
-from data.database import get_latest_equity, log_info
+from data.database import calculate_current_equity, log_info
 
 logger = logging.getLogger(__name__)
 
 
 def _get_current_capital() -> float:
-    eq = get_latest_equity()
-    if eq:
-        return eq["total_capital"]
-    return get_settings().get("initial_capital_gbp", 1000)
+    """Get current total capital (initial + realized PnL)."""
+    return calculate_current_equity()
 
 
 def _get_market_capital(market: str) -> float:

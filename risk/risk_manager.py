@@ -26,8 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.loader import get_risk_policies, get_settings
 from data.database import (
+    calculate_current_equity,
     count_open_trades,
-    get_latest_equity,
     get_open_pairs,
     log_info,
     log_warning,
@@ -42,11 +42,8 @@ def _get_policies() -> dict:
 
 
 def _get_current_capital() -> float:
-    """Get current total capital."""
-    eq = get_latest_equity()
-    if eq:
-        return eq["total_capital"]
-    return get_settings().get("initial_capital_gbp", 1000)
+    """Get current total capital (initial + realized PnL)."""
+    return calculate_current_equity()
 
 
 # ---------------------------------------------------------------------------

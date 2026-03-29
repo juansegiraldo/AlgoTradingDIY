@@ -156,6 +156,7 @@ def format_close_notification(trade: dict) -> str:
 
 def format_portfolio_status() -> str:
     GBP_PER_USDT = 1.0 / 1.27
+    settings = get_settings()
     equity = get_latest_equity()
     open_count = count_open_trades()
     realized_pnl = get_total_pnl()
@@ -164,11 +165,27 @@ def format_portfolio_status() -> str:
     if equity:
         capital = equity["total_capital"]
     else:
-        capital = get_settings().get("initial_capital_gbp", 1000)
+        capital = settings.get("initial_capital_gbp", 1000)
+
+    crypto_cfg = settings.get("markets", {}).get("crypto", {})
+    crypto_pct = float(crypto_cfg.get("capital_allocation_pct", 50))
+    crypto_alloc_gbp = capital * (crypto_pct / 100.0)
+    other_alloc_gbp = max(capital - crypto_alloc_gbp, 0.0)
+    other_pct = max(0.0, 100.0 - crypto_pct)
 
     wr_text = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
 
-    # Calculate unrealized PnL and total margin from open positions
+    # Fetch balance from Binance (live) or DB (paper) — source of truth
+    try:
+        from execution.binance_executor import fetch_usdt_balance
+        usdt_bal = fetch_usdt_balance()
+        exchange_free_gbp = usdt_bal["free"] * GBP_PER_USDT
+        exchange_used_gbp = usdt_bal["used"] * GBP_PER_USDT
+    except Exception:
+        exchange_free_gbp = None
+        exchange_used_gbp = None
+
+    # Calculate unrealized PnL from open positions
     unrealized_pnl = 0.0
     total_margin = 0.0
     trades = get_open_trades()
@@ -190,7 +207,14 @@ def format_portfolio_status() -> str:
         pass
 
     total_pnl = realized_pnl + unrealized_pnl
-    available = capital - total_margin + total_pnl
+
+    # Use exchange balance as primary, fallback to internal calc
+    if exchange_free_gbp is not None:
+        available = exchange_free_gbp
+        margin_display = exchange_used_gbp
+    else:
+        available = capital - total_margin + realized_pnl
+        margin_display = total_margin
 
     # Build text
     text = (
@@ -199,10 +223,16 @@ def format_portfolio_status() -> str:
         f"\U0001f3e6 <b>Capital inicial:</b> GBP {capital:,.2f}\n"
     )
 
+    text += (
+        f"\n<b>\U0001f4b8 Asignacion:</b>\n"
+        f"   \U0001f4b0 Cripto ({crypto_pct:.0f}%): GBP {crypto_alloc_gbp:,.2f}\n"
+        f"   \U0001f4b5 Otros ({other_pct:.0f}%): GBP {other_alloc_gbp:,.2f}\n"
+    )
+
     if open_count > 0:
         text += (
             f"\n<b>\U0001f4bc Posiciones ({open_count}):</b>\n"
-            f"   \U0001f512 Margen en uso: GBP {total_margin:,.2f}\n"
+            f"   \U0001f512 Margen en uso: GBP {margin_display:,.2f}\n"
             f"   \U0001f4b0 Disponible: GBP {available:,.2f}\n"
         )
 
@@ -328,6 +358,8 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from data.database import set_system_flag
+    set_system_flag("paused", "true")
     log_warning("telegram", "System PAUSED by user command")
     await update.message.reply_text(
         "\u23f8 <b>Sistema PAUSADO</b>\n\n"
@@ -338,6 +370,8 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from data.database import set_system_flag
+    set_system_flag("paused", "false")
     log_info("telegram", "System RESUMED by user command")
     await update.message.reply_text(
         "\u25b6 <b>Sistema REANUDADO</b>\n\n"
@@ -471,11 +505,8 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from execution.binance_executor import fetch_price, fetch_ohlcv
         from signals.indicators import ohlcv_to_dataframe, analyze
         from risk.position_sizer import calculate_position
-        from data.database import get_latest_equity, save_equity_snapshot
+        from data.database import calculate_current_equity
         import uuid
-
-        if not get_latest_equity():
-            save_equity_snapshot(total_capital=get_settings().get("initial_capital_gbp", 1000))
 
         price = fetch_price(pair)
 
@@ -524,23 +555,17 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         size_safe = calculate_position(pair, direction, price, sl, "crypto", 5)
         # Medium (15% risk)
         size_med = calculate_position(pair, direction, price, sl, "crypto", 10)
-        # All-in (entire crypto allocation)
-        eq = get_latest_equity()
-        capital = eq["total_capital"] if eq else 1000
+        # Capital for display
+        capital = calculate_current_equity()
         crypto_capital = capital * 0.5
-        allin_value = crypto_capital * 20  # max leverage
-        allin_size = round((allin_value * 1.27) / price, 8)
 
         dir_emoji = "\U0001f7e2" if direction == "long" else "\U0001f534"
 
         # Margin calculations for display
-        GBP_PER_USDT = 1.0 / 1.27
         margin_safe = size_safe["margin_required"]
         margin_med = size_med["margin_required"]
-        margin_allin = crypto_capital
         value_safe = size_safe["position_size_value"]
         value_med = size_med["position_size_value"]
-        value_allin = crypto_capital * 20
 
         info_text = (
             f"{dir_emoji} <b>{pair} — {direction.upper()}</b>\n"
@@ -558,10 +583,11 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\U0001f6d1 <b>Stop-Loss:</b> ${sl:,.2f} (-2%)\n"
             f"\U0001f3af <b>TP1:</b> ${tp1:,.2f} (+3%) | <b>TP2:</b> ${tp2:,.2f} (+6%)\n"
             f"\n"
+            f"\U0001f4b7 <b>Capital actual:</b> GBP {capital:,.0f}\n"
+            f"\n"
             f"<b>Elige tamano:</b>\n\n"
             f"\u2705 <b>Seguro</b> (5x) — Pones <b>GBP {margin_safe:,.0f}</b> \u2192 Posicion GBP {value_safe:,.0f} | Pierdes max GBP {size_safe['risk_amount']:,.0f}\n"
-            f"\U0001f525 <b>Medio</b> (10x) — Pones <b>GBP {margin_med:,.0f}</b> \u2192 Posicion GBP {value_med:,.0f} | Pierdes max GBP {size_med['risk_amount']:,.0f}\n"
-            f"\u26a0 <b>ALL-IN</b> (20x) — Pones <b>GBP {margin_allin:,.0f}</b> \u2192 Posicion GBP {value_allin:,.0f}"
+            f"\U0001f525 <b>Medio</b> (10x) — Pones <b>GBP {margin_med:,.0f}</b> \u2192 Posicion GBP {value_med:,.0f} | Pierdes max GBP {size_med['risk_amount']:,.0f}"
         )
 
         # Build signal for each size option
@@ -574,24 +600,15 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "trend": trend.get("trend", "unknown"), "strength": "manual",
         }
 
-        # Store signals for each button
+        # Store signals for each button (risk validation happens on GO via on_go_callback)
         id_safe = f"force_safe_{uuid.uuid4().hex[:6]}"
         id_med = f"force_med_{uuid.uuid4().hex[:6]}"
-        id_allin = f"force_allin_{uuid.uuid4().hex[:6]}"
 
         sig_safe = {**base_signal, "leverage": 5, **size_safe}
         sig_med = {**base_signal, "leverage": 10, **size_med}
-        sig_allin = {
-            **base_signal, "leverage": 20,
-            "position_size": allin_size,
-            "position_size_value": crypto_capital,
-            "risk_gbp": crypto_capital,
-            "risk_pct": 50,
-        }
 
         _pending_signals[id_safe] = sig_safe
         _pending_signals[id_med] = sig_med
-        _pending_signals[id_allin] = sig_allin
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -604,12 +621,6 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton(
                     f"\U0001f525 Medio (10x) \u2014 GBP {margin_med:,.0f}",
                     callback_data=f"go:{id_med}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    f"\u26a0 ALL-IN (20x) \u2014 GBP {margin_allin:,.0f}",
-                    callback_data=f"go:{id_allin}",
                 ),
             ],
             [

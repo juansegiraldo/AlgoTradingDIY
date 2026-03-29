@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS trades (
     take_profit_1 REAL,
     take_profit_2 REAL,
     position_size REAL NOT NULL,
+    remaining_size REAL,
+    tp1_hit_at TEXT,
     leverage REAL DEFAULT 1,
     pnl_absolute REAL,
     pnl_percent REAL,
@@ -62,6 +64,12 @@ CREATE TABLE IF NOT EXISTS circuit_breaker_events (
     details TEXT,
     resume_after TEXT
 );
+
+CREATE TABLE IF NOT EXISTS system_flags (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 # ---------------------------------------------------------------------------
@@ -80,6 +88,13 @@ def get_connection() -> sqlite3.Connection:
 def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA_SQL)
+        # Migrate existing DBs: add remaining_size and tp1_hit_at if missing
+        cursor = conn.execute("PRAGMA table_info(trades)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "remaining_size" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN remaining_size REAL")
+        if "tp1_hit_at" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN tp1_hit_at TEXT")
 
 
 def _now() -> str:
@@ -140,6 +155,17 @@ def close_trade(
     """
     with get_connection() as conn:
         conn.execute(sql, (_now(), exit_price, status, pnl_absolute, pnl_percent, trade_id))
+
+
+def update_tp1_state(trade_id: int, remaining_size: float) -> None:
+    """Record that TP1 was hit and update the remaining position size."""
+    sql = """
+    UPDATE trades
+    SET remaining_size = ?, tp1_hit_at = ?
+    WHERE id = ?
+    """
+    with get_connection() as conn:
+        conn.execute(sql, (remaining_size, _now(), trade_id))
 
 
 def get_open_trades() -> list[dict]:
@@ -293,6 +319,25 @@ def get_active_circuit_breaker() -> Optional[dict]:
         return dict(row) if row else None
 
 
+def get_system_flag(key: str) -> Optional[str]:
+    """Read a runtime system flag (e.g. 'paused')."""
+    sql = "SELECT value FROM system_flags WHERE key = ?"
+    with get_connection() as conn:
+        row = conn.execute(sql, (key,)).fetchone()
+        return row[0] if row else None
+
+
+def set_system_flag(key: str, value: str) -> None:
+    """Set a runtime system flag (upsert)."""
+    sql = """
+    INSERT INTO system_flags (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    """
+    with get_connection() as conn:
+        conn.execute(sql, (key, value, _now()))
+
+
 def get_circuit_breaker_history(limit: int = 20) -> list[dict]:
     sql = "SELECT * FROM circuit_breaker_events ORDER BY timestamp DESC LIMIT ?"
     with get_connection() as conn:
@@ -326,6 +371,19 @@ def get_total_pnl() -> float:
     sql = "SELECT COALESCE(SUM(pnl_absolute), 0.0) FROM trades WHERE status != 'open'"
     with get_connection() as conn:
         return conn.execute(sql).fetchone()[0]
+
+
+def calculate_current_equity() -> float:
+    """
+    Calculate live equity: initial_capital + realized PnL from all closed trades.
+
+    This is the authoritative source of capital — used by position sizer,
+    risk manager, and circuit breakers instead of stale equity snapshots.
+    """
+    from config.loader import get_settings
+    initial = get_settings().get("initial_capital_gbp", 1000)
+    realized_pnl = get_total_pnl()
+    return initial + realized_pnl
 
 
 def get_win_rate() -> Optional[float]:

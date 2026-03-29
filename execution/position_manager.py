@@ -27,6 +27,8 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.database import (
+    calculate_current_equity,
+    count_open_trades,
     get_open_trades,
     get_trade,
     close_trade,
@@ -34,6 +36,8 @@ from data.database import (
     log_info,
     log_warning,
     log_error,
+    save_equity_snapshot,
+    update_tp1_state,
 )
 from execution.binance_executor import fetch_price, close_position
 from notifications.telegram_bot import send_text_sync, send_close_notification_sync
@@ -53,6 +57,9 @@ _tp1_hit_trades: set[int] = set()
 # Tracks the remaining position size after a TP1 partial close.
 # Key: trade_id, Value: remaining size in base currency.
 _remaining_sizes: dict[int, float] = {}
+
+# Whether we've already reconstructed TP1 state from DB this session.
+_tp1_state_loaded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +107,39 @@ def _update_trade_notes(trade_id: int, notes: str) -> None:
         )
 
 
+def _load_tp1_state_from_db() -> None:
+    """Reconstruct TP1 partial-close state from DB on first run after restart."""
+    global _tp1_state_loaded
+    if _tp1_state_loaded:
+        return
+    _tp1_state_loaded = True
+
+    try:
+        trades = get_open_trades()
+        for t in trades:
+            if t.get("tp1_hit_at") and t.get("remaining_size") is not None:
+                tid = t["id"]
+                _tp1_hit_trades.add(tid)
+                _remaining_sizes[tid] = float(t["remaining_size"])
+                log_info(
+                    "position_manager",
+                    f"Restored TP1 state for trade #{tid}: "
+                    f"remaining_size={t['remaining_size']}",
+                )
+    except Exception as exc:
+        log_error("position_manager", f"Failed to restore TP1 state: {exc}")
+
+
+def _snapshot_equity_after_close() -> None:
+    """Save an equity snapshot after a trade close so reports stay accurate."""
+    try:
+        equity = calculate_current_equity()
+        open_count = count_open_trades()
+        save_equity_snapshot(total_capital=equity, open_positions=open_count)
+    except Exception as exc:
+        log_warning("position_manager", f"Could not save post-close equity snapshot: {exc}")
+
+
 def _get_effective_size(trade: dict) -> float:
     """
     Return the effective (remaining) position size for a trade.
@@ -125,6 +165,8 @@ def check_open_positions() -> None:
     Errors on individual trades are caught and logged so a single bad symbol
     cannot break the whole loop.
     """
+    _load_tp1_state_from_db()
+
     try:
         trades = get_open_trades()
     except Exception as exc:
@@ -269,6 +311,8 @@ def _handle_stop_loss(
         log_error("position_manager", f"DB close failed for SL trade #{trade_id}: {exc}")
         return
 
+    _snapshot_equity_after_close()
+
     # Clean up module state
     _tp1_hit_trades.discard(trade_id)
     _remaining_sizes.pop(trade_id, None)
@@ -303,9 +347,14 @@ def _handle_tp1(
         f"| Remaining {remaining_size} | Partial PnL {pnl_gbp:+.2f} GBP",
     )
 
-    # Mark TP1 reached before attempting the broker call to prevent race conditions
+    # Mark TP1 reached in memory and DB before broker call to prevent race conditions
     _tp1_hit_trades.add(trade_id)
     _remaining_sizes[trade_id] = remaining_size
+
+    try:
+        update_tp1_state(trade_id, remaining_size)
+    except Exception as exc:
+        log_error("position_manager", f"Could not persist TP1 state for trade #{trade_id}: {exc}")
 
     try:
         close_position(pair, direction, close_size)
@@ -315,7 +364,6 @@ def _handle_tp1(
             f"Broker partial close failed for TP1 trade #{trade_id}: {exc}",
         )
         logger.error("Broker partial close failed for %s #%d: %s", pair, trade_id, exc)
-        # Keep the trade open but update notes so the operator can see what happened.
 
     # Update notes in DB to record the partial close
     existing_notes: str = trade.get("notes") or ""
@@ -399,6 +447,8 @@ def _handle_tp2(
         log_error("position_manager", f"DB close failed for TP2 trade #{trade_id}: {exc}")
         return
 
+    _snapshot_equity_after_close()
+
     # Clean up module state
     _tp1_hit_trades.discard(trade_id)
     _remaining_sizes.pop(trade_id, None)
@@ -478,6 +528,8 @@ def close_trade_manual(trade_id: int) -> dict:
         msg = f"DB close failed for manual trade #{trade_id}: {exc}"
         log_error("position_manager", msg)
         return {"trade_id": trade_id, "success": False, "error": msg}
+
+    _snapshot_equity_after_close()
 
     # Clean up module state
     _tp1_hit_trades.discard(trade_id)
