@@ -110,14 +110,23 @@ def _format_signals_triggered(signals: dict) -> str:
 
 
 def format_execution_confirmation(trade: dict) -> str:
+    GBP_PER_USDT = 1.0 / 1.27
+    entry = float(trade["entry_price"])
+    size = float(trade["position_size"])
+    leverage = float(trade.get("leverage", 1))
+    notional_usd = size * entry
+    margin_gbp = (notional_usd / leverage) * GBP_PER_USDT
+    position_gbp = notional_usd * GBP_PER_USDT
     return (
         f"\u2705 <b>ORDEN EJECUTADA</b>\n"
         f"\n"
         f"\U0001f4c4 <b>{trade['pair']} {trade['direction'].upper()}</b>\n"
-        f"\U0001f4b0 Entrada: {trade['entry_price']:,.2f}\n"
-        f"\U0001f6d1 SL: {trade['stop_loss']:,.2f}\n"
-        f"\U0001f4ca Tamano: {trade['position_size']}\n"
-        f"\U0001f4aa Leverage: {trade.get('leverage', 1)}x\n"
+        f"\U0001f4b0 Entrada: ${entry:,.2f}\n"
+        f"\U0001f6d1 SL: ${float(trade['stop_loss']):,.2f}\n"
+        f"\U0001f4aa Leverage: {leverage:.0f}x\n"
+        f"\n"
+        f"\U0001f4b0 <b>Tu pones:</b> GBP {margin_gbp:,.2f}\n"
+        f"\U0001f4ca <b>Posicion total:</b> GBP {position_gbp:,.2f}\n"
         f"\U0001f3f7 Modo: {trade.get('mode', 'paper').upper()}"
     )
 
@@ -146,6 +155,7 @@ def format_close_notification(trade: dict) -> str:
 
 
 def format_portfolio_status() -> str:
+    GBP_PER_USDT = 1.0 / 1.27
     equity = get_latest_equity()
     open_count = count_open_trades()
     realized_pnl = get_total_pnl()
@@ -158,11 +168,19 @@ def format_portfolio_status() -> str:
 
     wr_text = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
 
-    # Calculate unrealized PnL from open positions
+    # Calculate unrealized PnL and total margin from open positions
     unrealized_pnl = 0.0
+    total_margin = 0.0
+    trades = get_open_trades()
     try:
         from execution.position_manager import get_unrealized_pnl
-        for t in get_open_trades():
+        for t in trades:
+            # Margin in use
+            entry = float(t["entry_price"])
+            size = float(t["position_size"])
+            leverage = float(t.get("leverage") or 1)
+            total_margin += (size * entry / leverage) * GBP_PER_USDT
+            # Unrealized PnL
             try:
                 upnl = get_unrealized_pnl(t)
                 unrealized_pnl += upnl["unrealized_pnl_gbp"]
@@ -172,28 +190,43 @@ def format_portfolio_status() -> str:
         pass
 
     total_pnl = realized_pnl + unrealized_pnl
+    available = capital - total_margin + total_pnl
 
+    # Build text
     text = (
-        f"\U0001f4ca <b>PORTFOLIO STATUS</b>\n"
+        f"\U0001f4ca <b>MI PORTAFOLIO</b>\n"
         f"\n"
-        f"\U0001f4b0 Capital: GBP {capital:,.2f}\n"
+        f"\U0001f3e6 <b>Capital inicial:</b> GBP {capital:,.2f}\n"
     )
 
     if open_count > 0:
-        unr_emoji = "\U0001f4c8" if unrealized_pnl >= 0 else "\U0001f4c9"
-        text += f"{unr_emoji} PnL Abierto: GBP {unrealized_pnl:+,.2f}\n"
+        text += (
+            f"\n<b>\U0001f4bc Posiciones ({open_count}):</b>\n"
+            f"   \U0001f512 Margen en uso: GBP {total_margin:,.2f}\n"
+            f"   \U0001f4b0 Disponible: GBP {available:,.2f}\n"
+        )
+
+    text += f"\n<b>\U0001f4b5 Rendimiento:</b>\n"
+
+    if open_count > 0:
+        unr_emoji = "\U0001f7e2" if unrealized_pnl >= 0 else "\U0001f534"
+        sign = "+" if unrealized_pnl >= 0 else ""
+        text += f"   {unr_emoji} Posiciones abiertas: {sign}{unrealized_pnl:,.2f} GBP\n"
 
     if realized_pnl != 0:
-        text += f"\U0001f4b5 PnL Cerrado: GBP {realized_pnl:+,.2f}\n"
+        real_emoji = "\U0001f7e2" if realized_pnl >= 0 else "\U0001f534"
+        real_sign = "+" if realized_pnl >= 0 else ""
+        text += f"   {real_emoji} Trades cerrados: {real_sign}{realized_pnl:,.2f} GBP\n"
 
-    pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
-    text += (
-        f"{pnl_emoji} PnL Total: GBP {total_pnl:+,.2f}\n"
-        f"\U0001f3af Win Rate: {wr_text}\n"
-        f"\U0001f4cb Posiciones abiertas: {open_count}\n"
-        f"\n"
-        f"\U0001f552 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
+    total_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+    total_sign = "+" if total_pnl >= 0 else ""
+    total_pct = (total_pnl / capital * 100) if capital > 0 else 0
+    text += f"   {total_emoji} <b>Total: {total_sign}{total_pnl:,.2f} GBP ({total_sign}{total_pct:.1f}%)</b>\n"
+
+    if win_rate is not None:
+        text += f"\n\U0001f3af Win Rate: {wr_text}\n"
+
+    text += f"\n\U0001f552 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
 
     return text
 
@@ -500,6 +533,15 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         dir_emoji = "\U0001f7e2" if direction == "long" else "\U0001f534"
 
+        # Margin calculations for display
+        GBP_PER_USDT = 1.0 / 1.27
+        margin_safe = size_safe["margin_required"]
+        margin_med = size_med["margin_required"]
+        margin_allin = crypto_capital
+        value_safe = size_safe["position_size_value"]
+        value_med = size_med["position_size_value"]
+        value_allin = crypto_capital * 20
+
         info_text = (
             f"{dir_emoji} <b>{pair} — {direction.upper()}</b>\n"
             f"\n"
@@ -516,7 +558,10 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\U0001f6d1 <b>Stop-Loss:</b> ${sl:,.2f} (-2%)\n"
             f"\U0001f3af <b>TP1:</b> ${tp1:,.2f} (+3%) | <b>TP2:</b> ${tp2:,.2f} (+6%)\n"
             f"\n"
-            f"<b>Elige tamano:</b>"
+            f"<b>Elige tamano:</b>\n\n"
+            f"\u2705 <b>Seguro</b> (5x) — Pones <b>GBP {margin_safe:,.0f}</b> \u2192 Posicion GBP {value_safe:,.0f} | Pierdes max GBP {size_safe['risk_amount']:,.0f}\n"
+            f"\U0001f525 <b>Medio</b> (10x) — Pones <b>GBP {margin_med:,.0f}</b> \u2192 Posicion GBP {value_med:,.0f} | Pierdes max GBP {size_med['risk_amount']:,.0f}\n"
+            f"\u26a0 <b>ALL-IN</b> (20x) — Pones <b>GBP {margin_allin:,.0f}</b> \u2192 Posicion GBP {value_allin:,.0f}"
         )
 
         # Build signal for each size option
@@ -551,19 +596,19 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    f"\u2705 Seguro — {size_safe['position_size']:.4f} (GBP {size_safe['risk_amount']:.0f} riesgo)",
+                    f"\u2705 Seguro (5x) \u2014 GBP {margin_safe:,.0f}",
                     callback_data=f"go:{id_safe}",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    f"\U0001f525 Medio — {size_med['position_size']:.4f} (GBP {size_med['risk_amount']:.0f} riesgo)",
+                    f"\U0001f525 Medio (10x) \u2014 GBP {margin_med:,.0f}",
                     callback_data=f"go:{id_med}",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    f"\u26a0 ALL-IN — {allin_size:.4f} (GBP {crypto_capital:.0f} TODO)",
+                    f"\u26a0 ALL-IN (20x) \u2014 GBP {margin_allin:,.0f}",
                     callback_data=f"go:{id_allin}",
                 ),
             ],
