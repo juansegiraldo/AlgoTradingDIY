@@ -75,6 +75,38 @@ def _get_chat_id() -> Optional[str]:
     return _chat_id
 
 
+def _get_force_pairs() -> list[str]:
+    pairs = get_settings().get("markets", {}).get("crypto", {}).get("pairs", [])
+    return pairs or ["BTC/USDT"]
+
+
+def _normalize_force_pair(raw_pair: Optional[str]) -> str:
+    """Normalize /force input into a configured crypto pair."""
+    pairs = _get_force_pairs()
+    if not raw_pair:
+        return pairs[0]
+
+    normalized = raw_pair.strip().upper().replace("-", "/")
+    if normalized in pairs:
+        return normalized
+
+    if normalized.endswith("USDT") and "/" not in normalized:
+        normalized = f"{normalized[:-4]}/USDT"
+    elif "/" not in normalized:
+        normalized = f"{normalized}/USDT"
+
+    if normalized in pairs:
+        return normalized
+
+    base_symbol = normalized.split("/", 1)[0]
+    for pair in pairs:
+        if pair.split("/", 1)[0] == base_symbol:
+            return pair
+
+    supported = ", ".join(pair.split("/", 1)[0] for pair in pairs)
+    raise ValueError(f"Activo no soportado: {raw_pair}. Usa uno de: {supported}")
+
+
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
@@ -161,16 +193,16 @@ def format_portfolio_status() -> str:
     open_count = count_open_trades()
     realized_pnl = get_total_pnl()
     win_rate = get_win_rate()
-
+    initial_capital = float(settings.get("initial_capital_gbp", 1000))
     if equity:
-        capital = equity["total_capital"]
+        current_capital = float(equity["total_capital"])
     else:
-        capital = settings.get("initial_capital_gbp", 1000)
+        current_capital = initial_capital + realized_pnl
 
     crypto_cfg = settings.get("markets", {}).get("crypto", {})
     crypto_pct = float(crypto_cfg.get("capital_allocation_pct", 50))
-    crypto_alloc_gbp = capital * (crypto_pct / 100.0)
-    other_alloc_gbp = max(capital - crypto_alloc_gbp, 0.0)
+    crypto_alloc_gbp = current_capital * (crypto_pct / 100.0)
+    other_alloc_gbp = max(current_capital - crypto_alloc_gbp, 0.0)
     other_pct = max(0.0, 100.0 - crypto_pct)
 
     wr_text = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
@@ -213,15 +245,18 @@ def format_portfolio_status() -> str:
         available = exchange_free_gbp
         margin_display = exchange_used_gbp
     else:
-        available = capital - total_margin + realized_pnl
+        available = current_capital - total_margin
         margin_display = total_margin
 
     # Build text
     text = (
         f"\U0001f4ca <b>MI PORTAFOLIO</b>\n"
         f"\n"
-        f"\U0001f3e6 <b>Capital inicial:</b> GBP {capital:,.2f}\n"
+        f"\U0001f3e6 <b>Capital inicial:</b> GBP {initial_capital:,.2f}\n"
     )
+
+    if abs(current_capital - initial_capital) >= 0.005 or open_count > 0:
+        text += f"\U0001f4bc <b>Capital actual:</b> GBP {current_capital:,.2f}\n"
 
     text += (
         f"\n<b>\U0001f4b8 Asignacion:</b>\n"
@@ -250,7 +285,7 @@ def format_portfolio_status() -> str:
 
     total_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
     total_sign = "+" if total_pnl >= 0 else ""
-    total_pct = (total_pnl / capital * 100) if capital > 0 else 0
+    total_pct = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0
     text += f"   {total_emoji} <b>Total: {total_sign}{total_pnl:,.2f} GBP ({total_sign}{total_pct:.1f}%)</b>\n"
 
     if win_rate is not None:
@@ -487,14 +522,27 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show asset info, suggest sizes, let user pick with buttons."""
-    args = (context.args or [])
-    pair = args[0].upper() if args else "BTC/USDT"
-    if "/" not in pair:
-        pair = pair + "/USDT"
-
     direction = "long"
-    if len(args) > 1 and args[1].lower() in ("short", "sell", "s"):
-        direction = "short"
+    pair_arg = None
+    for arg in (context.args or []):
+        low = arg.lower()
+        if low in ("short", "sell", "s"):
+            direction = "short"
+            continue
+        if low in ("long", "buy", "l"):
+            direction = "long"
+            continue
+        if pair_arg is None:
+            pair_arg = arg
+
+    try:
+        pair = _normalize_force_pair(pair_arg)
+    except ValueError as exc:
+        await update.message.reply_text(
+            f"\u274c <b>Error:</b> {exc}",
+            parse_mode="HTML",
+        )
+        return
 
     await update.message.reply_text(
         f"\U0001f50e <b>Analizando {pair}...</b>",
@@ -504,7 +552,7 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         from execution.binance_executor import fetch_price, fetch_ohlcv
         from signals.indicators import ohlcv_to_dataframe, analyze
-        from risk.position_sizer import calculate_position
+        from risk.position_sizer import enrich_signal_with_sizing
         from data.database import calculate_current_equity
         import uuid
 
@@ -551,21 +599,49 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             tp1 = round(price * 0.97, 2)
             tp2 = round(price * 0.94, 2)
 
-        # Conservative (5% risk - R1 compliant)
-        size_safe = calculate_position(pair, direction, price, sl, "crypto", 5)
-        # Medium (15% risk)
-        size_med = calculate_position(pair, direction, price, sl, "crypto", 10)
-        # Capital for display
         capital = calculate_current_equity()
-        crypto_capital = capital * 0.5
-
         dir_emoji = "\U0001f7e2" if direction == "long" else "\U0001f534"
 
-        # Margin calculations for display
-        margin_safe = size_safe["margin_required"]
-        margin_med = size_med["margin_required"]
-        value_safe = size_safe["position_size_value"]
-        value_med = size_med["position_size_value"]
+        base_signal = {
+            "pair": pair,
+            "timeframe": "manual",
+            "market": "crypto",
+            "direction": direction,
+            "entry_price": price,
+            "stop_loss": sl,
+            "take_profit_1": tp1,
+            "take_profit_2": tp2,
+            "signal_count": 4,
+            "min_required": 3,
+            "signals_triggered": {"manual": True},
+            "trend": trend.get("trend", "unknown"),
+            "strength": "manual",
+        }
+
+        sig_safe = enrich_signal_with_sizing({
+            **base_signal,
+            "leverage": 5,
+            "size_scale": 0.4,
+            "size_profile": "safe",
+        })
+        sig_med = enrich_signal_with_sizing({
+            **base_signal,
+            "leverage": 10,
+            "size_scale": 1.0,
+            "size_profile": "medium",
+        })
+
+        if not sig_safe.get("sizing_approved", False) and not sig_med.get("sizing_approved", False):
+            await update.message.reply_text(
+                "\u26d4 <b>No se pudo calcular un tamano valido para este activo.</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        margin_safe = sig_safe["margin_required"]
+        margin_med = sig_med["margin_required"]
+        value_safe = sig_safe["position_size_value"]
+        value_med = sig_med["position_size_value"]
 
         info_text = (
             f"{dir_emoji} <b>{pair} — {direction.upper()}</b>\n"
@@ -586,26 +662,13 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\U0001f4b7 <b>Capital actual:</b> GBP {capital:,.0f}\n"
             f"\n"
             f"<b>Elige tamano:</b>\n\n"
-            f"\u2705 <b>Seguro</b> (5x) — Pones <b>GBP {margin_safe:,.0f}</b> \u2192 Posicion GBP {value_safe:,.0f} | Pierdes max GBP {size_safe['risk_amount']:,.0f}\n"
-            f"\U0001f525 <b>Medio</b> (10x) — Pones <b>GBP {margin_med:,.0f}</b> \u2192 Posicion GBP {value_med:,.0f} | Pierdes max GBP {size_med['risk_amount']:,.0f}"
+            f"\u2705 <b>Seguro</b> (5x) - Pones <b>GBP {margin_safe:,.0f}</b> -> Posicion GBP {value_safe:,.0f} | Pierdes max GBP {sig_safe['risk_gbp']:,.0f}\n"
+            f"\U0001f525 <b>Medio</b> (10x) - Pones <b>GBP {margin_med:,.0f}</b> -> Posicion GBP {value_med:,.0f} | Pierdes max GBP {sig_med['risk_gbp']:,.0f}"
         )
 
-        # Build signal for each size option
-        base_signal = {
-            "pair": pair, "timeframe": "manual", "market": "crypto",
-            "direction": direction, "entry_price": price,
-            "stop_loss": sl, "take_profit_1": tp1, "take_profit_2": tp2,
-            "signal_count": 4, "min_required": 3,
-            "signals_triggered": {"manual": True},
-            "trend": trend.get("trend", "unknown"), "strength": "manual",
-        }
-
-        # Store signals for each button (risk validation happens on GO via on_go_callback)
+        # Store signals for each button (risk validation happens again on GO)
         id_safe = f"force_safe_{uuid.uuid4().hex[:6]}"
         id_med = f"force_med_{uuid.uuid4().hex[:6]}"
-
-        sig_safe = {**base_signal, "leverage": 5, **size_safe}
-        sig_med = {**base_signal, "leverage": 10, **size_med}
 
         _pending_signals[id_safe] = sig_safe
         _pending_signals[id_med] = sig_med

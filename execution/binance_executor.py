@@ -114,7 +114,6 @@ def fetch_order_book(pair: str, limit: int = 10) -> dict:
 # ---------------------------------------------------------------------------
 
 _paper_balance = {"USDT": {"free": 0, "used": 0, "total": 0}}
-_paper_positions: list[dict] = []
 _paper_orders: list[dict] = []
 _paper_initialized = False
 
@@ -133,6 +132,63 @@ def _init_paper():
     }
     _paper_initialized = True
     log_info("binance", f"Paper balance initialized: {usdt_capital:.2f} USDT")
+
+
+def _paper_trade_size(trade: dict) -> float:
+    """Return the currently open size for a paper trade."""
+    remaining_size = trade.get("remaining_size")
+    if remaining_size is not None:
+        return float(remaining_size)
+    return float(trade["position_size"])
+
+
+def _paper_positions_from_db() -> list[dict]:
+    """
+    Build paper positions from open trades in SQLite.
+
+    This keeps paper-mode position state alive across restarts and correctly
+    aggregates multiple open trades on the same pair.
+    """
+    aggregated: dict[tuple[str, str], dict] = {}
+
+    for trade in get_open_trades():
+        pair = trade["pair"]
+        side = trade["direction"]
+        size = _paper_trade_size(trade)
+        if size <= 0:
+            continue
+
+        key = (pair, side)
+        entry_price = float(trade["entry_price"])
+        leverage = float(trade.get("leverage") or 1.0)
+
+        if key not in aggregated:
+            aggregated[key] = {
+                "pair": pair,
+                "side": side,
+                "size": size,
+                "entry_price": entry_price,
+                "unrealized_pnl": 0,
+                "leverage": leverage,
+                "liquidation_price": None,
+            }
+            continue
+
+        position = aggregated[key]
+        previous_size = float(position["size"])
+        total_size = previous_size + size
+        if total_size <= 0:
+            continue
+
+        position["entry_price"] = (
+            (float(position["entry_price"]) * previous_size) + (entry_price * size)
+        ) / total_size
+        position["leverage"] = (
+            (float(position["leverage"]) * previous_size) + (leverage * size)
+        ) / total_size
+        position["size"] = total_size
+
+    return list(aggregated.values())
 
 
 def _paper_generate_order_id() -> str:
@@ -257,7 +313,7 @@ def fetch_usdt_balance() -> dict:
 def fetch_positions() -> list[dict]:
     """Get open positions."""
     if _is_paper_mode():
-        return list(_paper_positions)
+        return _paper_positions_from_db()
     exchange = get_exchange()
     positions = exchange.fetch_positions()
     return [
@@ -273,6 +329,25 @@ def fetch_positions() -> list[dict]:
         for p in positions
         if p["contracts"] and p["contracts"] > 0
     ]
+
+
+def fetch_position_size(pair: str) -> float:
+    """Return the actual open position size on the exchange (0 if no position)."""
+    if _is_paper_mode():
+        return sum(
+            float(position["size"])
+            for position in _paper_positions_from_db()
+            if position["pair"] == pair
+        )
+    try:
+        exchange = get_exchange()
+        positions = exchange.fetch_positions([pair])
+        for p in positions:
+            if p["symbol"] == pair and p["contracts"] and p["contracts"] > 0:
+                return float(p["contracts"])
+    except Exception as exc:
+        log_warning("binance", f"Could not fetch position size for {pair}: {exc}")
+    return 0.0
 
 
 def set_leverage(pair: str, leverage: int) -> dict:
@@ -379,22 +454,10 @@ def execute_trade(
         entry_order = place_market_order(pair, entry_side, amount)
         entry_price = entry_order.get("average") or entry_order.get("price", 0)
 
-        # 3. Track paper position
-        if _is_paper_mode():
-            _paper_positions.append({
-                "pair": pair,
-                "side": direction,
-                "size": amount,
-                "entry_price": entry_price,
-                "unrealized_pnl": 0,
-                "leverage": leverage,
-                "liquidation_price": None,
-            })
-
-        # 4. Place stop-loss (always required by R7)
+        # 3. Place stop-loss (always required by R7)
         sl_order = place_stop_loss(pair, exit_side, amount, stop_loss_price)
 
-        # 5. Place take-profit orders
+        # 4. Place take-profit orders
         tp1_order = None
         tp2_order = None
         if take_profit_1_price:
@@ -480,19 +543,52 @@ def fetch_open_orders(pair: Optional[str] = None) -> list[dict]:
 
 
 def close_position(pair: str, direction: str, amount: float) -> dict:
-    """Close an open position with a market order."""
-    exit_side = "sell" if direction == "long" else "buy"
-    order = place_market_order(pair, exit_side, amount, params={"reduceOnly": True})
+    """Close an open position with a market order.
 
-    if _is_paper_mode():
-        _paper_positions[:] = [p for p in _paper_positions if p["pair"] != pair]
+    Checks actual exchange position first to avoid closing a position
+    that was already closed by an exchange-side SL/TP order.
+    """
+    actual_size = fetch_position_size(pair)
+
+    if actual_size <= 0:
+        log_info("binance", f"Position already closed on exchange: {pair} {direction}")
+        # Cancel any stale orders and return a synthetic result
+        try:
+            cancel_all_orders(pair)
+        except Exception:
+            pass
+        return {
+            "id": "ALREADY_CLOSED",
+            "pair": pair,
+            "side": "sell" if direction == "long" else "buy",
+            "amount": amount,
+            "price": fetch_price(pair),
+            "average": fetch_price(pair),
+            "status": "closed",
+            "filled": amount,
+            "remaining": 0,
+            "cost": 0,
+            "paper": _is_paper_mode(),
+        }
+
+    # If exchange has less than requested, close only what's actually open
+    close_amount = min(amount, actual_size)
+    if close_amount < amount:
+        log_warning(
+            "binance",
+            f"Adjusting close size for {pair}: requested {amount}, "
+            f"exchange has {actual_size}. Closing {close_amount}.",
+        )
+
+    exit_side = "sell" if direction == "long" else "buy"
+    order = place_market_order(pair, exit_side, close_amount, params={"reduceOnly": True})
 
     try:
         cancel_all_orders(pair)
     except Exception as e:
         log_warning("binance", f"Could not cancel remaining orders for {pair}: {e}")
 
-    log_info("binance", f"Position closed: {pair} {direction} {amount}")
+    log_info("binance", f"Position closed: {pair} {direction} {close_amount}")
     return order
 
 

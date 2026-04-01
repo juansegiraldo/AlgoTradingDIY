@@ -41,6 +41,19 @@ def _get_market_capital(market: str) -> float:
     return capital * (alloc_pct / 100.0)
 
 
+def _apply_size_scale(sizing: dict, size_scale: float) -> dict:
+    """Scale a sizing result down for manual profiles such as /force."""
+    scaled = dict(sizing)
+    scale = max(0.0, min(float(size_scale), 1.0))
+
+    for key in ("position_size", "position_size_value", "risk_amount", "risk_pct", "margin_required"):
+        digits = 8 if key == "position_size" else 2
+        scaled[key] = round(float(scaled.get(key, 0.0)) * scale, digits)
+
+    scaled["reason"] = f"{scaled.get('reason', 'Position sized')} | scale={scale:.2f}"
+    return scaled
+
+
 def calculate_position(
     pair: str,
     direction: str,
@@ -161,6 +174,10 @@ def enrich_signal_with_sizing(signal: dict) -> dict:
         market=signal.get("market", "crypto"),
         leverage=signal.get("leverage", 1),
     )
+
+    size_scale = signal.get("size_scale")
+    if size_scale is not None:
+        sizing = _apply_size_scale(sizing, size_scale)
 
     signal["position_size"] = sizing["position_size"]
     signal["position_size_value"] = sizing["position_size_value"]

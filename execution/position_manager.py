@@ -39,7 +39,7 @@ from data.database import (
     save_equity_snapshot,
     update_tp1_state,
 )
-from execution.binance_executor import fetch_price, close_position
+from execution.binance_executor import fetch_price, fetch_position_size, close_position
 from notifications.telegram_bot import send_text_sync, send_close_notification_sync
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,73 @@ def _get_effective_size(trade: dict) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _reconcile_exchange_positions(trades: list[dict]) -> list[dict]:
+    """
+    Check each open DB trade against the exchange. If a position no longer
+    exists on the exchange (e.g. Binance already filled the SL/TP order),
+    close it in the DB so we don't try to manage a ghost position.
+
+    Returns the list of trades that are still actually open.
+    """
+    still_open = []
+
+    for trade in trades:
+        trade_id: int = trade["id"]
+        pair: str = trade["pair"]
+        direction: str = trade["direction"]
+        entry_price: float = float(trade["entry_price"])
+        leverage: float = float(trade.get("leverage") or 1.0)
+
+        try:
+            exchange_size = fetch_position_size(pair)
+        except Exception:
+            # If we can't check, assume it's still open (safer)
+            still_open.append(trade)
+            continue
+
+        if exchange_size > 0:
+            still_open.append(trade)
+            continue
+
+        # Position gone from exchange — close in DB
+        try:
+            current_price = fetch_price(pair)
+        except Exception:
+            current_price = entry_price
+
+        close_size = _get_effective_size(trade)
+        pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, current_price, close_size, leverage)
+        pnl_gbp = _usdt_to_gbp(pnl_usdt)
+
+        log_warning(
+            "position_manager",
+            f"Reconciliation: trade #{trade_id} {pair} no longer on exchange. "
+            f"Closing in DB @ {current_price:,.4f} | PnL {pnl_gbp:+.2f} GBP",
+        )
+
+        try:
+            close_trade(
+                trade_id=trade_id,
+                exit_price=current_price,
+                status="closed_exchange",
+                pnl_absolute=round(pnl_gbp, 4),
+                pnl_percent=round(pnl_pct, 4),
+            )
+            _snapshot_equity_after_close()
+            _tp1_hit_trades.discard(trade_id)
+            _remaining_sizes.pop(trade_id, None)
+
+            closed_trade = _build_closed_trade_dict(
+                trade, current_price, "closed_exchange", pnl_gbp, pnl_pct
+            )
+            _notify_close(closed_trade)
+        except Exception as exc:
+            log_error("position_manager", f"Reconciliation DB close failed #{trade_id}: {exc}")
+            still_open.append(trade)
+
+    return still_open
+
+
 def check_open_positions() -> None:
     """
     Evaluate every open trade against its stop-loss and take-profit levels.
@@ -174,6 +241,11 @@ def check_open_positions() -> None:
         logger.error("Failed to fetch open trades", exc_info=True)
         return
 
+    if not trades:
+        return
+
+    # Reconcile: close DB trades whose exchange position is already gone
+    trades = _reconcile_exchange_positions(trades)
     if not trades:
         return
 
