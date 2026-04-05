@@ -7,9 +7,9 @@ Starts:
   3. APScheduler with all scheduled tasks:
      - Scanner every 5 min
      - Health check every 60 min
-     - Partial report every 4 hours
-     - Daily report at 22:00 GMT
-     - Weekly report Friday 20:00 GMT
+     - Summary at 08:00, 12:00, 20:00 London time (auto-adjusts BST/GMT)
+     - Daily report at 22:00 UTC
+     - Weekly report Friday 20:00 UTC
 
 Usage:
   python main.py          # Start the system
@@ -227,12 +227,32 @@ async def main():
         name="Health Check",
     )
 
-    # Partial report: every 4 hours
+    # Summaries at fixed London times (CronTrigger auto-adjusts BST/GMT)
+    import pytz
+    london_tz = pytz.timezone("Europe/London")
+
+    morning_time = sched_cfg.get("morning_report_time", "08:00").split(":")
     scheduler.add_job(
         scheduled_partial_report,
-        IntervalTrigger(hours=sched_cfg.get("partial_report_interval_hours", 4)),
-        id="partial_report",
-        name="Partial Report",
+        CronTrigger(hour=int(morning_time[0]), minute=int(morning_time[1]), timezone=london_tz),
+        id="morning_report",
+        name="Morning Report (08:00 London)",
+    )
+
+    midday_time = sched_cfg.get("midday_report_time", "12:00").split(":")
+    scheduler.add_job(
+        scheduled_partial_report,
+        CronTrigger(hour=int(midday_time[0]), minute=int(midday_time[1]), timezone=london_tz),
+        id="midday_report",
+        name="Midday Report (12:00 London)",
+    )
+
+    evening_time = sched_cfg.get("evening_report_time", "20:00").split(":")
+    scheduler.add_job(
+        scheduled_partial_report,
+        CronTrigger(hour=int(evening_time[0]), minute=int(evening_time[1]), timezone=london_tz),
+        id="evening_report",
+        name="Evening Report (20:00 London)",
     )
 
     # Daily report: at 22:00 UTC

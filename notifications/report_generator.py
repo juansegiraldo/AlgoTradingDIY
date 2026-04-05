@@ -141,8 +141,11 @@ def generate_weekly_report() -> str:
 
 
 def generate_partial_report() -> str:
-    """Generate a partial P&L update (every 4 hours)."""
+    """Generate a scheduled P&L summary (08:00, 12:00, 20:00 London time)."""
+    import pytz
     now = datetime.now(timezone.utc)
+    london_tz = pytz.timezone("Europe/London")
+    now_london = now.astimezone(london_tz)
     today = now.strftime("%Y-%m-%d")
     daily_pnl = get_daily_pnl(today)
     open_count = count_open_trades()
@@ -165,7 +168,7 @@ def generate_partial_report() -> str:
     total_pnl = realized_pnl + unrealized_pnl
     pnl_emoji = "\U0001f4b5" if total_pnl >= 0 else "\U0001f4b8"
 
-    text = f"{pnl_emoji} <b>Update {now.strftime('%H:%M UTC')}</b>\n"
+    text = f"{pnl_emoji} <b>Resumen {now_london.strftime('%H:%M')} (Londres)</b>\n"
     if open_count > 0 and unrealized_pnl != 0:
         text += f"PnL abierto: GBP {unrealized_pnl:+,.2f} | "
     text += (

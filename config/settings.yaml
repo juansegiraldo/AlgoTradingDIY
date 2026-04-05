@@ -51,11 +51,13 @@ position_management:
 scheduler:
   scanner_interval_minutes: 5
   health_check_interval_minutes: 60
-  partial_report_interval_hours: 4
-  daily_report_time: "22:00"
+  morning_report_time: "08:00"   # London time (auto-adjusts BST/GMT)
+  midday_report_time: "12:00"    # London time
+  evening_report_time: "20:00"   # London time
+  daily_report_time: "22:00"     # UTC (nightly full report)
   weekly_report_day: "friday"
   weekly_report_time: "20:00"
-  timezone: "GMT"
+  timezone: "Europe/London"
 
 telegram:
   send_signals: true

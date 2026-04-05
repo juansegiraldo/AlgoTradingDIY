@@ -502,7 +502,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             signal,
             risk_gbp=signal.get("risk_gbp", 0),
             risk_pct=signal.get("risk_pct", 0),
-            position_size=f"{signal.get('position_size', 0):.6f} BTC",
+            position_size=signal.get("position_size", 0),
         )
         text = format_signal_alert(tg_signal)
         keyboard = InlineKeyboardMarkup([
