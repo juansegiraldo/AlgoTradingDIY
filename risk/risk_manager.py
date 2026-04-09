@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.loader import get_risk_policies, get_settings
+from config.loader import get_live_stage_profile, get_risk_policies, get_settings
 from data.database import (
     calculate_current_equity,
     count_open_trades,
@@ -43,7 +43,12 @@ def _get_policies() -> dict:
 
 def _get_current_capital() -> float:
     """Get current total capital (initial + realized PnL)."""
-    return calculate_current_equity()
+    capital = calculate_current_equity()
+    settings = get_settings()
+    if settings.get("mode", "paper") == "paper":
+        return capital
+    stage_cap = float(get_live_stage_profile().get("max_operable_capital_gbp", capital) or capital)
+    return min(capital, stage_cap)
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +78,7 @@ def check_r1_max_loss_per_trade(signal: dict) -> tuple[bool, str]:
 
     potential_loss = position_size_value * loss_pct_on_trade
 
-    if potential_loss > max_loss:
+    if potential_loss > max_loss + 0.005:
         return (
             False,
             f"R1 FAIL: Potential loss GBP {potential_loss:.2f} exceeds max "
@@ -87,6 +92,11 @@ def check_r5_max_positions() -> tuple[bool, str]:
     """R5: Do not exceed max simultaneous positions."""
     policies = _get_policies()
     max_pos = policies.get("max_simultaneous_positions", 3)
+    settings = get_settings()
+    if settings.get("mode", "paper") != "paper":
+        stage_max = get_live_stage_profile().get("max_simultaneous_positions")
+        if stage_max is not None:
+            max_pos = min(max_pos, int(stage_max))
     current = count_open_trades()
 
     if current >= max_pos:
@@ -172,6 +182,33 @@ def check_r8_forex_hours(signal: dict) -> tuple[bool, str]:
     return True, f"R8 OK: Forex allowed at {current_time} GMT"
 
 
+def check_live_stage_constraints(signal: dict) -> tuple[bool, str]:
+    """Additional live-only validation for stage caps and leverage."""
+    settings = get_settings()
+    if settings.get("mode", "paper") == "paper":
+        return True, "LIVE_STAGE OK: Paper mode"
+
+    profile = get_live_stage_profile()
+    stage_name = settings.get("live_stage", "stage_10")
+    leverage = float(signal.get("leverage") or 1)
+    leverage_max = profile.get("leverage_max")
+    if leverage_max is not None and leverage > float(leverage_max):
+        return False, (
+            f"LIVE_STAGE FAIL: leverage {leverage}x exceeds {leverage_max}x "
+            f"for {stage_name}"
+        )
+
+    stage_cap = profile.get("max_operable_capital_gbp")
+    position_margin = float(signal.get("margin_required") or 0.0)
+    if stage_cap is not None and position_margin > float(stage_cap):
+        return False, (
+            f"LIVE_STAGE FAIL: margin GBP {position_margin:.2f} exceeds stage cap "
+            f"GBP {float(stage_cap):.2f}"
+        )
+
+    return True, f"LIVE_STAGE OK: {stage_name}"
+
+
 def check_circuit_breaker() -> tuple[bool, str]:
     """R2/R3/R4: Check if any circuit breaker is active."""
     cb = is_circuit_breaker_active()
@@ -240,6 +277,12 @@ def validate_trade(signal: dict) -> dict:
     # R8: Forex hours
     passed, reason = check_r8_forex_hours(signal)
     rules["R8"] = {"passed": passed, "reason": reason}
+    if not passed:
+        rejections.append(reason)
+
+    # Live stage constraints
+    passed, reason = check_live_stage_constraints(signal)
+    rules["LIVE_STAGE"] = {"passed": passed, "reason": reason}
     if not passed:
         rejections.append(reason)
 
