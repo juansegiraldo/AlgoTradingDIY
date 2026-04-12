@@ -194,8 +194,16 @@ def format_portfolio_status() -> str:
     realized_pnl = get_total_pnl()
     win_rate = get_win_rate()
     initial_capital = float(settings.get("initial_capital_gbp", 1000))
+    equity_source = "internal"
+    free_balance_gbp = None
+    margin_snapshot_gbp = None
     if equity:
         current_capital = float(equity["total_capital"])
+        equity_source = str(equity.get("source") or "internal")
+        if equity.get("free_balance_gbp") is not None:
+            free_balance_gbp = float(equity["free_balance_gbp"])
+        if equity.get("margin_used_gbp") is not None:
+            margin_snapshot_gbp = float(equity["margin_used_gbp"])
     else:
         current_capital = initial_capital + realized_pnl
 
@@ -247,6 +255,10 @@ def format_portfolio_status() -> str:
     else:
         available = current_capital - total_margin
         margin_display = total_margin
+    if free_balance_gbp is not None:
+        available = free_balance_gbp
+    if margin_snapshot_gbp is not None:
+        margin_display = margin_snapshot_gbp
 
     # Build text
     text = (
@@ -257,6 +269,11 @@ def format_portfolio_status() -> str:
 
     if abs(current_capital - initial_capital) >= 0.005 or open_count > 0:
         text += f"\U0001f4bc <b>Capital actual:</b> GBP {current_capital:,.2f}\n"
+    text += (
+        f"\U0001f4e1 <b>Fuente equity:</b> {equity_source.upper()}\n"
+        f"\U0001f3f7 <b>Modo:</b> {settings.get('mode', 'paper').upper()} | "
+        f"Stage: {settings.get('live_stage', 'stage_10')}\n"
+    )
 
     text += (
         f"\n<b>\U0001f4b8 Asignacion:</b>\n"
@@ -423,6 +440,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/force - Comprar YA (ej: /force btc, /force eth, /force sol short)\n"
         "/test - Trade de prueba con GO/SKIP\n"
         "/scan - Escanear mercados ahora\n"
+        "/ready - Chequeo de readiness y saldo Binance\n"
         "/close - Ver posiciones con boton Cerrar por trade\n"
         "/close 5 - Cerrar trade #5 directamente\n"
         "/closeall - Cerrar TODAS las posiciones (pide confirmacion)\n"
@@ -726,6 +744,23 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text, parse_mode="HTML")
 
     except Exception as e:
+        await update.message.reply_text(
+            f"\u274c <b>Error:</b> {e}",
+            parse_mode="HTML",
+        )
+
+
+async def cmd_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show operational readiness and current Binance balance snapshot."""
+    try:
+        from notifications.report_generator import generate_readiness_report
+        import concurrent.futures
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            report = await loop.run_in_executor(pool, generate_readiness_report)
+        await update.message.reply_text(report, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"cmd_ready error: {e}", exc_info=True)
         await update.message.reply_text(
             f"\u274c <b>Error:</b> {e}",
             parse_mode="HTML",
@@ -1165,6 +1200,7 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("test", cmd_test))
     _app.add_handler(CommandHandler("force", cmd_force))
     _app.add_handler(CommandHandler("scan", cmd_scan))
+    _app.add_handler(CommandHandler("ready", cmd_ready))
     _app.add_handler(CommandHandler("pause", cmd_pause))
     _app.add_handler(CommandHandler("resume", cmd_resume))
     _app.add_handler(CommandHandler("close", cmd_close))

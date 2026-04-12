@@ -13,7 +13,6 @@ from config.loader import get_settings
 from data.database import (
     get_all_trades,
     get_daily_pnl,
-    get_latest_equity,
     get_open_trades,
     get_total_pnl,
     get_weekly_pnl,
@@ -34,15 +33,32 @@ def generate_daily_report() -> str:
     mode = get_settings().get("mode", "paper").upper()
 
     daily_pnl = get_daily_pnl(today)
-    total_pnl = get_total_pnl()
+    realized_total = get_total_pnl()
     win_rate = get_win_rate()
     pf = get_profit_factor()
     risk = get_risk_status()
     open_count = count_open_trades()
 
+    # Include unrealized PnL from open positions
+    unrealized_pnl = 0.0
+    try:
+        from execution.position_manager import get_unrealized_pnl
+        from data.database import get_open_trades as _get_open
+        for t in _get_open():
+            try:
+                upnl = get_unrealized_pnl(t)
+                unrealized_pnl += upnl["unrealized_pnl_gbp"]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    total_pnl = realized_total + unrealized_pnl
+    daily_total = daily_pnl + unrealized_pnl
+
     wr_text = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
     pf_text = f"{pf:.2f}" if pf is not None else "N/A"
-    pnl_emoji = "\U0001f4b5" if daily_pnl >= 0 else "\U0001f4b8"
+    pnl_emoji = "\U0001f4b5" if daily_total >= 0 else "\U0001f4b8"
 
     # Count today's trades
     trades_today = [
@@ -50,11 +66,16 @@ def generate_daily_report() -> str:
         if t.get("timestamp_open", "").startswith(today)
     ]
 
+    unrealized_line = ""
+    if open_count > 0 and unrealized_pnl != 0:
+        unrealized_line = f"\U0001f4ca <b>Posiciones abiertas:</b> GBP {unrealized_pnl:+,.2f}\n"
+
     report = (
         f"\U0001f4ca <b>REPORTE DIARIO — {today}</b>\n"
         f"\U0001f3f7 Modo: {mode}\n"
         f"\n"
-        f"{pnl_emoji} <b>PnL del dia:</b> GBP {daily_pnl:+,.2f}\n"
+        f"{pnl_emoji} <b>PnL del dia:</b> GBP {daily_total:+,.2f}\n"
+        f"{unrealized_line}"
         f"\U0001f4b0 <b>PnL total:</b> GBP {total_pnl:+,.2f}\n"
         f"\U0001f4b0 <b>Capital:</b> GBP {risk['capital_current']:,.2f}\n"
         f"\n"
@@ -166,16 +187,86 @@ def generate_partial_report() -> str:
         pass
 
     total_pnl = realized_pnl + unrealized_pnl
-    pnl_emoji = "\U0001f4b5" if total_pnl >= 0 else "\U0001f4b8"
+    # daily_pnl = closed trades today; add unrealized for full day picture
+    daily_total = daily_pnl + unrealized_pnl
+    pnl_emoji = "\U0001f4b5" if daily_total >= 0 else "\U0001f4b8"
 
     text = f"{pnl_emoji} <b>Resumen {now_london.strftime('%H:%M')} (Londres)</b>\n"
+    parts = []
     if open_count > 0 and unrealized_pnl != 0:
-        text += f"PnL abierto: GBP {unrealized_pnl:+,.2f} | "
-    text += (
-        f"PnL hoy: GBP {daily_pnl:+,.2f} | Total: GBP {total_pnl:+,.2f} | "
-        f"Abiertas: {open_count}"
-    )
+        parts.append(f"Abierto: GBP {unrealized_pnl:+,.2f}")
+    if daily_pnl != 0:
+        parts.append(f"Cerrado hoy: GBP {daily_pnl:+,.2f}")
+    parts.append(f"PnL hoy: GBP {daily_total:+,.2f}")
+    parts.append(f"Total: GBP {total_pnl:+,.2f}")
+    parts.append(f"Abiertas: {open_count}")
+    text += " | ".join(parts)
     return text
+
+
+def generate_readiness_report() -> str:
+    """Generate a compact operational readiness report for live trading."""
+    settings = get_settings()
+    mode = settings.get("mode", "paper").upper()
+    stage = settings.get("live_stage", "stage_10")
+    pairs = ", ".join(settings.get("markets", {}).get("crypto", {}).get("pairs", []))
+    risk = get_risk_status()
+
+    try:
+        from execution.binance_executor import live_readiness_check, fetch_positions, fetch_open_orders
+        readiness = live_readiness_check()
+        snapshot = readiness.get("snapshot", {})
+        positions = fetch_positions()
+        orders = fetch_open_orders()
+        ready = readiness.get("ready", False)
+        status = "LISTO" if ready else "BLOQUEADO"
+        free_gbp = snapshot.get("free_gbp", 0.0)
+        total_gbp = snapshot.get("total_gbp", 0.0)
+    except Exception as exc:
+        ready = False
+        status = "ERROR"
+        positions = []
+        orders = []
+        free_gbp = 0.0
+        total_gbp = 0.0
+        readiness = {"error": str(exc)}
+
+    error_line = ""
+    if readiness.get("error"):
+        error_line = f"\n\u26a0 Error: {readiness['error']}"
+
+    return (
+        f"\U0001f6e1 <b>READY CHECK</b>\n"
+        f"Modo: {mode}\n"
+        f"Stage: {stage}\n"
+        f"Estado: <b>{status}</b>\n"
+        f"Saldo Binance: GBP {total_gbp:,.2f}\n"
+        f"Disponible: GBP {free_gbp:,.2f}\n"
+        f"Posiciones abiertas: {len(positions)}\n"
+        f"Ordenes abiertas: {len(orders)}\n"
+        f"Circuit breaker: {'ACTIVO' if risk['circuit_breaker_active'] else 'OK'}\n"
+        f"Pares habilitados: {pairs or 'N/A'}"
+        f"{error_line}"
+    )
+
+
+def generate_morning_report() -> str:
+    """Generate the morning Binance balance and readiness report."""
+    try:
+        from execution.binance_executor import save_account_snapshot
+        snapshot = save_account_snapshot()
+        header = (
+            f"\U0001f305 <b>REPORTE MATINAL</b>\n"
+            f"Binance total: GBP {snapshot['total_gbp']:,.2f}\n"
+            f"Disponible: GBP {snapshot['free_gbp']:,.2f}\n"
+            f"Margen usado: GBP {snapshot['used_gbp']:,.2f}\n\n"
+        )
+    except Exception as exc:
+        header = (
+            f"\U0001f305 <b>REPORTE MATINAL</b>\n"
+            f"\u26a0 No se pudo guardar snapshot Binance: {exc}\n\n"
+        )
+    return header + generate_readiness_report()
 
 
 def send_daily_report() -> None:
@@ -207,3 +298,11 @@ def send_partial_report() -> None:
     report = generate_partial_report()
     send_text_sync(report)
     logger.info("Partial report sent")
+
+
+def send_morning_report() -> None:
+    """Generate and send the dedicated morning readiness report."""
+    from notifications.telegram_bot import send_text_sync
+    report = generate_morning_report()
+    send_text_sync(report)
+    logger.info("Morning report sent")
