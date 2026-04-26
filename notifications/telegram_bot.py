@@ -515,6 +515,39 @@ def format_party_blurb() -> str:
     )
 
 
+def format_glossary() -> str:
+    """Compact glossary for terms shown in scan, alerts, and positions."""
+    return (
+        "\U0001f4d8 <b>Glosario rapido</b>\n\n"
+        "<b>Bullish:</b> contexto alcista; el precio favorece subida.\n"
+        "<b>Bearish:</b> contexto bajista; el precio favorece caida.\n"
+        "<b>Mixed:</b> tendencia no clara.\n"
+        "<b>Long:</b> compra; gana si el precio sube.\n"
+        "<b>Short:</b> apuesta a caida. En Kraken Spot esta deshabilitado.\n\n"
+        "<b>1h / 4h:</b> timeframe. Cada vela resume 1 hora o 4 horas.\n"
+        "<b>Vela:</b> open, high, low, close y volumen de un periodo.\n"
+        "<b>OHLCV:</b> Open, High, Low, Close, Volume.\n\n"
+        "<b>RSI:</b> indicador de momentum. Aqui cuenta cuando cruza 50.\n"
+        "<b>EMA:</b> media movil que pesa mas el precio reciente. EMA 9/21 busca cruces cortos.\n"
+        "<b>MACD:</b> indicador de momentum basado en medias; cuenta cuando cruza su signal line.\n"
+        "<b>Vol:</b> volumen. Confirma si hay mas actividad que el promedio.\n"
+        "<b>ATR:</b> volatilidad promedio. El bot lo usa en paper para SL/TP dinamicos.\n\n"
+        "<b>Trigger:</b> condicion que se activo ahora.\n"
+        "<b>L / S / -:</b> long, short, o sin trigger en /scan.\n"
+        "<b>3 de 4:</b> minimo de confirmaciones para generar senal.\n"
+        "<b>GO/SKIP:</b> ejecutar o ignorar una alerta.\n\n"
+        "<b>SL:</b> stop loss; salida para limitar perdida.\n"
+        "<b>TP1 / TP2:</b> take profit parcial/final.\n"
+        "<b>R:</b> riesgo tomado hasta el SL. TP1 1.5R = objetivo 1.5 veces ese riesgo.\n"
+        "<b>Break-even:</b> movimiento minimo para cubrir fees y no perder.\n\n"
+        "<b>Fees:</b> comisiones de Kraken. El bot estima y luego guarda reales si Kraken las devuelve.\n"
+        "<b>Gross:</b> PnL antes de fees.\n"
+        "<b>Net:</b> PnL despues de fees.\n"
+        "<b>Paper:</b> simulacion con precios reales, sin mover dinero.\n"
+        "<b>Semi_auto:</b> real solo con confirmacion manual GO/SKIP."
+    )
+
+
 def _indicator_mark(indicator: dict) -> str:
     if not indicator.get("triggered"):
         return "-"
@@ -606,6 +639,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ready - Readiness Kraken antes de operar\n"
         "/golive - Checklist go-live Kraken\n"
         "/party - Explicacion rapida del bot\n"
+        "/glossary - Diccionario rapido de terminos\n"
         "/pause - Pausar el sistema\n"
         "/resume - Reanudar el sistema\n"
         "/help - Ayuda\n\n"
@@ -653,6 +687,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ready - Readiness, saldo Kraken, posiciones y ordenes\n"
         "/golive - Checklist operativo antes de pasar a semi_auto\n"
         "/party - Blurb rapido para explicar el bot\n"
+        "/glossary - Diccionario rapido de terminos\n"
         "/force - Compra manual controlada (ej: /force btc, /force eth)\n"
         "/test - Trade de prueba con GO/SKIP\n"
         "/scan - Escanear mercados ahora\n"
@@ -679,6 +714,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_party(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(format_party_blurb(), parse_mode="HTML")
+
+
+async def cmd_glossary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(format_glossary(), parse_mode="HTML")
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1471,6 +1510,7 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("golive", cmd_golive))
     _app.add_handler(CommandHandler("checklist", cmd_golive))
     _app.add_handler(CommandHandler("party", cmd_party))
+    _app.add_handler(CommandHandler("glossary", cmd_glossary))
     _app.add_handler(CommandHandler("pause", cmd_pause))
     _app.add_handler(CommandHandler("resume", cmd_resume))
     _app.add_handler(CommandHandler("close", cmd_close))

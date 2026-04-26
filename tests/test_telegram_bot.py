@@ -81,6 +81,21 @@ def test_format_party_blurb_explains_bot_briefly(monkeypatch):
     assert "PnL neto" in text
 
 
+def test_format_glossary_defines_scan_terms():
+    text = telegram_bot.format_glossary()
+
+    assert "Glosario rapido" in text
+    assert "Bullish" in text
+    assert "4h" in text
+    assert "ATR" in text
+    assert "RSI" in text
+    assert "EMA" in text
+    assert "MACD" in text
+    assert "Trigger" in text
+    assert "GO/SKIP" in text
+    assert "Net" in text
+
+
 def test_format_scan_report_includes_indicator_details():
     text = telegram_bot.format_scan_report(
         [
