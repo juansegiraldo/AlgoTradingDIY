@@ -31,6 +31,7 @@ from data.database import (
     open_trade,
     save_equity_snapshot,
     count_open_trades,
+    set_system_flag,
 )
 from signals.scanner import scan_all
 from risk.position_sizer import enrich_signal_with_sizing
@@ -47,6 +48,29 @@ def _is_system_paused() -> bool:
     """Check if the system is paused (reads from DB flag, not cached YAML)."""
     from data.database import get_system_flag
     return get_system_flag("paused") == "true"
+
+
+def _auto_pause_system(reason: str, signal: Optional[dict] = None) -> None:
+    """Pause the system and notify the user after a critical live failure."""
+    settings = get_settings()
+    if settings.get("mode", "paper") == "paper":
+        return
+    if not settings.get("live_deployment", {}).get("auto_pause_on_live_failures", True):
+        return
+
+    set_system_flag("paused", "true")
+    pair = signal.get("pair") if signal else "N/A"
+    log_error("pipeline", f"AUTO-PAUSE activated for {pair}: {reason}")
+    try:
+        from notifications.telegram_bot import send_text_sync
+        send_text_sync(
+            f"\u26d4 <b>SISTEMA PAUSADO AUTOMATICAMENTE</b>\n\n"
+            f"Par: {pair}\n"
+            f"Motivo: {reason}\n\n"
+            f"<i>Revisa el exchange, logs y posiciones antes de usar /resume.</i>"
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +190,26 @@ def execute_signal(signal: dict) -> dict:
         if not result.get("success"):
             error_msg = result.get("error", "Unknown error")
             log_error("pipeline", f"Execution failed for {pair}: {error_msg}")
+            _auto_pause_system(error_msg, signal)
             _notify_error(signal, error_msg)
             return result
 
         # Record in database
+        entry_fee_gbp = float(
+            result.get("entry_fee_gbp")
+            if result.get("entry_fee_gbp") is not None
+            else signal.get("estimated_entry_fee_gbp", 0.0)
+        )
+        fee_details = {
+            "entry_fee_gbp": entry_fee_gbp,
+            "entry_fee_source": result.get("entry_fee_source", "estimated"),
+            "entry_fee_currency": result.get("entry_fee_currency", "GBP"),
+            "fee_rate_pct": result.get("fee_rate_pct") or signal.get("fee_rate_pct"),
+            "estimated_round_trip_fee_gbp": result.get(
+                "estimated_round_trip_fee_gbp",
+                signal.get("estimated_round_trip_fee_gbp", 0.0),
+            ),
+        }
         trade_id = open_trade(
             market=market,
             pair=pair,
@@ -185,6 +225,8 @@ def execute_signal(signal: dict) -> dict:
             notes=f"Strength: {signal.get('strength', 'N/A')} | "
                   f"Timeframe: {signal.get('timeframe', 'N/A')} | "
                   f"Trend: {signal.get('trend', 'N/A')}",
+            entry_fee_gbp=entry_fee_gbp,
+            fee_details=fee_details,
         )
 
         result["trade_id"] = trade_id
@@ -198,6 +240,7 @@ def execute_signal(signal: dict) -> dict:
     except Exception as e:
         log_error("pipeline", f"Execution error for {pair}: {e}")
         logger.error(f"Execution error: {e}", exc_info=True)
+        _auto_pause_system(str(e), signal)
         _notify_error(signal, str(e))
         return {"success": False, "error": str(e)}
 
@@ -205,7 +248,7 @@ def execute_signal(signal: dict) -> dict:
 def _execute_on_broker(signal: dict, market: str) -> dict:
     """Route execution to the correct broker."""
     if market == "crypto":
-        from execution.binance_executor import execute_trade
+        from execution.crypto_executor import execute_trade
         return execute_trade(
             pair=signal["pair"],
             direction=signal["direction"],
@@ -303,6 +346,12 @@ def _notify_execution(signal: dict, result: dict, trade_id: int) -> None:
             "position_size": f"{signal.get('position_size', 0):.6f}",
             "leverage": signal.get("leverage", 1),
             "mode": get_settings().get("mode", "paper"),
+            "entry_fee_gbp": result.get("entry_fee_gbp", signal.get("estimated_entry_fee_gbp", 0.0)),
+            "estimated_round_trip_fee_gbp": result.get(
+                "estimated_round_trip_fee_gbp",
+                signal.get("estimated_round_trip_fee_gbp", 0.0),
+            ),
+            "fee_breakeven_pct": signal.get("fee_breakeven_pct", 0.0),
         }
         send_execution_confirmation_sync(trade_data)
     except Exception as e:
@@ -382,11 +431,13 @@ if __name__ == "__main__":
 
     # Simulate a forced signal to test execution
     print("\n[2] Simulated signal -> execution test...")
-    from execution.binance_executor import fetch_price
-    btc_price = fetch_price("BTC/USDT")
+    from execution.crypto_executor import fetch_price
+    settings = get_settings()
+    test_pair = settings.get("markets", {}).get("crypto", {}).get("pairs", ["BTC/GBP"])[0]
+    btc_price = fetch_price(test_pair)
 
     test_signal = {
-        "pair": "BTC/USDT",
+        "pair": test_pair,
         "timeframe": "1h",
         "market": "crypto",
         "direction": "long",
@@ -394,7 +445,7 @@ if __name__ == "__main__":
         "stop_loss": round(btc_price * 0.98, 2),
         "take_profit_1": round(btc_price * 1.03, 2),
         "take_profit_2": round(btc_price * 1.06, 2),
-        "leverage": 5,
+        "leverage": settings.get("markets", {}).get("crypto", {}).get("leverage_default", 1),
         "signal_count": 3,
         "min_required": 3,
         "signals_triggered": {"rsi": True, "ema": True, "macd": False, "volume": True},

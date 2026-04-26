@@ -7,23 +7,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import streamlit as st
 import pandas as pd
 
+from config.loader import get_settings
 from data.database import get_open_trades
 
 
 def render():
-    st.title("\U0001f4cb Posiciones Abiertas")
+    crypto_cfg = get_settings().get("markets", {}).get("crypto", {})
+    exchange = str(crypto_cfg.get("exchange", "kraken")).upper()
+    pairs = ", ".join(crypto_cfg.get("pairs", [])) or "N/A"
+
+    st.title(f"\U0001f4cb Posiciones {exchange}")
+    st.caption(f"Ruta crypto activa: {exchange} Spot | Pares: {pairs}")
 
     trades = get_open_trades()
 
     if not trades:
-        st.info("\U0001f4ad No hay posiciones abiertas en este momento.")
+        st.info(f"\U0001f4ad No hay posiciones abiertas en {exchange} / DB local.")
         return
 
     # Try to get current prices for unrealized P&L
     for t in trades:
         try:
             if t["market"] == "crypto":
-                from execution.binance_executor import fetch_price
+                from execution.crypto_executor import fetch_price
                 current = fetch_price(t["pair"])
                 if t["direction"] == "long":
                     upnl = (current - t["entry_price"]) / t["entry_price"] * 100

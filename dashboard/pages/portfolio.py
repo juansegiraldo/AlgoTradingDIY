@@ -12,6 +12,7 @@ from config.loader import get_settings
 from data.database import (
     get_latest_equity,
     get_equity_history,
+    get_total_fees,
     get_total_pnl,
     get_daily_pnl,
     get_win_rate,
@@ -25,10 +26,14 @@ def render():
     st.title("\U0001f4b0 Portfolio Overview")
 
     settings = get_settings()
+    crypto_cfg = settings.get("markets", {}).get("crypto", {})
+    exchange = str(crypto_cfg.get("exchange", "kraken")).upper()
     initial = settings.get("initial_capital_gbp", 1000)
     risk = get_risk_status()
     current = risk["capital_current"]
+    latest_equity = get_latest_equity() or {}
     total_pnl = get_total_pnl()
+    total_fees = get_total_fees()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_pnl(today)
     win_rate = get_win_rate()
@@ -38,7 +43,7 @@ def render():
     # Top metrics row
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Capital", f"GBP {current:,.2f}", f"{total_return:+.1f}%")
-    col2.metric("PnL Total", f"GBP {total_pnl:+,.2f}")
+    col2.metric("PnL Total Neto", f"GBP {total_pnl:+,.2f}", delta=f"Fees -GBP {total_fees:,.2f}")
     col3.metric("PnL Hoy", f"GBP {daily:+,.2f}")
     col4.metric("Posiciones", count_open_trades())
 
@@ -47,7 +52,15 @@ def render():
     col5.metric("Win Rate", f"{win_rate:.1f}%" if win_rate else "N/A")
     col6.metric("Profit Factor", f"{pf:.2f}" if pf else "N/A")
     col7.metric("Drawdown", f"{risk['drawdown_pct']:.1f}%")
-    col8.metric("Modo", settings.get("mode", "paper").upper())
+    col8.metric("Modo", f"{settings.get('mode', 'paper').upper()} / {exchange}")
+
+    if latest_equity:
+        st.caption(
+            "Snapshot: "
+            f"{str(latest_equity.get('source') or 'internal').upper()} | "
+            f"Free GBP {float(latest_equity.get('free_balance_gbp') or 0):,.2f} | "
+            f"Margin GBP {float(latest_equity.get('margin_used_gbp') or 0):,.2f}"
+        )
 
     # Equity curve
     st.markdown("---")

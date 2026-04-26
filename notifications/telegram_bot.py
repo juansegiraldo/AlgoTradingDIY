@@ -33,10 +33,18 @@ from data.database import (
     count_open_trades,
     get_latest_equity,
     get_open_trades,
+    get_total_fees,
     get_total_pnl,
     get_win_rate,
     log_info,
     log_warning,
+)
+from execution.crypto_executor import (
+    fetch_quote_balance,
+    format_price,
+    get_exchange_name,
+    get_quote_currency,
+    quote_to_gbp,
 )
 # NOTE: execution.position_manager is imported lazily inside cmd_close/cmd_closeall/callback_handler
 # to avoid circular imports (position_manager imports telegram_bot for notifications)
@@ -77,7 +85,7 @@ def _get_chat_id() -> Optional[str]:
 
 def _get_force_pairs() -> list[str]:
     pairs = get_settings().get("markets", {}).get("crypto", {}).get("pairs", [])
-    return pairs or ["BTC/USDT"]
+    return pairs or ["BTC/GBP"]
 
 
 def _normalize_force_pair(raw_pair: Optional[str]) -> str:
@@ -90,21 +98,30 @@ def _normalize_force_pair(raw_pair: Optional[str]) -> str:
     if normalized in pairs:
         return normalized
 
-    if normalized.endswith("USDT") and "/" not in normalized:
-        normalized = f"{normalized[:-4]}/USDT"
-    elif "/" not in normalized:
-        normalized = f"{normalized}/USDT"
-
-    if normalized in pairs:
-        return normalized
-
+    compact = normalized.replace("/", "")
     base_symbol = normalized.split("/", 1)[0]
     for pair in pairs:
-        if pair.split("/", 1)[0] == base_symbol:
+        pair_base, pair_quote = pair.split("/", 1)
+        if base_symbol == pair_base or compact == f"{pair_base}{pair_quote}":
             return pair
 
     supported = ", ".join(pair.split("/", 1)[0] for pair in pairs)
     raise ValueError(f"Activo no soportado: {raw_pair}. Usa uno de: {supported}")
+
+
+def _notional_gbp(pair: str, amount: float) -> float:
+    return quote_to_gbp(pair, amount)
+
+
+def _position_value_gbp(pair: str, size: float, entry_price: float) -> float:
+    return _notional_gbp(pair, size * entry_price)
+
+
+def _active_exchange_label() -> str:
+    try:
+        return get_exchange_name().upper()
+    except Exception:
+        return str(get_settings().get("markets", {}).get("crypto", {}).get("exchange", "kraken")).upper()
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +131,15 @@ def _normalize_force_pair(raw_pair: Optional[str]) -> str:
 
 def format_signal_alert(signal: dict) -> str:
     direction_emoji = "\U0001f7e2" if signal["direction"] == "long" else "\U0001f534"
+    exit_model = signal.get("exit_model") or {}
+    exit_line = ""
+    if exit_model.get("type") == "paper_atr":
+        exit_line = (
+            f"\U0001f4d0 <b>Salida paper ATR:</b> "
+            f"SL {float(exit_model.get('stop_loss_pct', 0)):.2f}% | "
+            f"TP1 {float(exit_model.get('take_profit_1_pct', 0)):.2f}% | "
+            f"TP2 {float(exit_model.get('take_profit_2_pct', 0)):.2f}%\n"
+        )
     return (
         f"{direction_emoji} <b>{signal['pair']} {signal['direction'].upper()}</b>\n"
         f"\n"
@@ -121,9 +147,12 @@ def format_signal_alert(signal: dict) -> str:
         f"\U0001f6d1 <b>Stop-Loss:</b> {signal['stop_loss']:,.2f}\n"
         f"\U0001f3af <b>TP1:</b> {float(signal['take_profit_1']):,.2f}\n"
         f"\U0001f3af <b>TP2:</b> {float(signal['take_profit_2']):,.2f}\n"
+        f"{exit_line}"
         f"\n"
         f"\U0001f4ca <b>Tamano:</b> {float(signal['position_size']):.6f}\n"
         f"\U000026a0 <b>Riesgo:</b> GBP {float(signal.get('risk_gbp', 0)):.1f} ({float(signal.get('risk_pct', 0)):.1f}%)\n"
+        f"\U0001f9fe <b>Fees est. ida/vuelta:</b> GBP {float(signal.get('estimated_round_trip_fee_gbp', 0)):.2f} "
+        f"(break-even {float(signal.get('fee_breakeven_pct', 0)):.2f}%)\n"
         f"\U0001f4aa <b>Apalancamiento:</b> {signal.get('leverage', 1)}x\n"
         f"\U0001f4c8 <b>Mercado:</b> {signal.get('market', 'N/A')}\n"
         f"\n"
@@ -142,29 +171,41 @@ def _format_signals_triggered(signals: dict) -> str:
 
 
 def format_execution_confirmation(trade: dict) -> str:
-    GBP_PER_USDT = 1.0 / 1.27
+    pair = trade["pair"]
     entry = float(trade["entry_price"])
     size = float(trade["position_size"])
     leverage = float(trade.get("leverage", 1))
-    notional_usd = size * entry
-    margin_gbp = (notional_usd / leverage) * GBP_PER_USDT
-    position_gbp = notional_usd * GBP_PER_USDT
+    notional_quote = size * entry
+    margin_gbp = _notional_gbp(pair, notional_quote / leverage)
+    position_gbp = _notional_gbp(pair, notional_quote)
+    entry_fee = float(trade.get("entry_fee_gbp") or 0.0)
+    round_trip_fee = float(trade.get("estimated_round_trip_fee_gbp") or entry_fee * 2.0)
+    fee_breakeven = (
+        float(trade.get("fee_breakeven_pct") or (round_trip_fee / position_gbp * 100.0))
+        if position_gbp > 0
+        else 0.0
+    )
     return (
         f"\u2705 <b>ORDEN EJECUTADA</b>\n"
         f"\n"
         f"\U0001f4c4 <b>{trade['pair']} {trade['direction'].upper()}</b>\n"
-        f"\U0001f4b0 Entrada: ${entry:,.2f}\n"
-        f"\U0001f6d1 SL: ${float(trade['stop_loss']):,.2f}\n"
+        f"\U0001f4b0 Entrada: {format_price(pair, entry)}\n"
+        f"\U0001f6d1 SL: {format_price(pair, float(trade['stop_loss']))}\n"
         f"\U0001f4aa Leverage: {leverage:.0f}x\n"
         f"\n"
         f"\U0001f4b0 <b>Tu pones:</b> GBP {margin_gbp:,.2f}\n"
         f"\U0001f4ca <b>Posicion total:</b> GBP {position_gbp:,.2f}\n"
+        f"\U0001f9fe <b>Fee entrada:</b> GBP {entry_fee:,.4f}\n"
+        f"\U0001f9fe <b>Fees ida/vuelta est.:</b> GBP {round_trip_fee:,.4f} "
+        f"(break-even {fee_breakeven:.2f}%)\n"
         f"\U0001f3f7 Modo: {trade.get('mode', 'paper').upper()}"
     )
 
 
 def format_close_notification(trade: dict) -> str:
     pnl = trade.get("pnl_absolute", 0)
+    gross = float(trade.get("pnl_gross_gbp") if trade.get("pnl_gross_gbp") is not None else pnl)
+    fees = float(trade.get("total_fees_gbp") or 0.0)
     pnl_emoji = "\U0001f4b5" if pnl >= 0 else "\U0001f4b8"
     status_map = {
         "closed_tp1": "\U0001f3af TP1 alcanzado",
@@ -182,16 +223,18 @@ def format_close_notification(trade: dict) -> str:
         f"\U0001f4b0 Entrada: {trade['entry_price']:,.2f}\n"
         f"\U0001f3c1 Salida: {trade.get('exit_price', 'N/A')}\n"
         f"\n"
-        f"{'PnL: +' if pnl >= 0 else 'PnL: '}{pnl:.2f} GBP ({trade.get('pnl_percent', 0):.1f}%)"
+        f"Gross: {gross:+.2f} GBP\n"
+        f"Fees: -{fees:.2f} GBP\n"
+        f"{'Net: +' if pnl >= 0 else 'Net: '}{pnl:.2f} GBP ({trade.get('pnl_percent', 0):.1f}%)"
     )
 
 
 def format_portfolio_status() -> str:
-    GBP_PER_USDT = 1.0 / 1.27
     settings = get_settings()
     equity = get_latest_equity()
     open_count = count_open_trades()
     realized_pnl = get_total_pnl()
+    total_fees = get_total_fees()
     win_rate = get_win_rate()
     initial_capital = float(settings.get("initial_capital_gbp", 1000))
     equity_source = "internal"
@@ -212,15 +255,19 @@ def format_portfolio_status() -> str:
     crypto_alloc_gbp = current_capital * (crypto_pct / 100.0)
     other_alloc_gbp = max(current_capital - crypto_alloc_gbp, 0.0)
     other_pct = max(0.0, 100.0 - crypto_pct)
+    exchange_label = _active_exchange_label()
+    crypto_pairs = ", ".join(crypto_cfg.get("pairs", [])) or "N/A"
+    quote_currency = get_quote_currency()
 
     wr_text = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
 
-    # Fetch balance from Binance (live) or DB (paper) — source of truth
+    # Fetch balance from the configured exchange or DB-derived paper balance.
     try:
-        from execution.binance_executor import fetch_usdt_balance
-        usdt_bal = fetch_usdt_balance()
-        exchange_free_gbp = usdt_bal["free"] * GBP_PER_USDT
-        exchange_used_gbp = usdt_bal["used"] * GBP_PER_USDT
+        quote_bal = fetch_quote_balance()
+        quote = quote_bal.get("currency") or get_quote_currency()
+        pair_for_quote = f"BTC/{quote}"
+        exchange_free_gbp = quote_to_gbp(pair_for_quote, quote_bal["free"])
+        exchange_used_gbp = quote_to_gbp(pair_for_quote, quote_bal["used"])
     except Exception:
         exchange_free_gbp = None
         exchange_used_gbp = None
@@ -236,7 +283,7 @@ def format_portfolio_status() -> str:
             entry = float(t["entry_price"])
             size = float(t["position_size"])
             leverage = float(t.get("leverage") or 1)
-            total_margin += (size * entry / leverage) * GBP_PER_USDT
+            total_margin += _notional_gbp(t["pair"], size * entry / leverage)
             # Unrealized PnL
             try:
                 upnl = get_unrealized_pnl(t)
@@ -271,9 +318,38 @@ def format_portfolio_status() -> str:
         text += f"\U0001f4bc <b>Capital actual:</b> GBP {current_capital:,.2f}\n"
     text += (
         f"\U0001f4e1 <b>Fuente equity:</b> {equity_source.upper()}\n"
+        f"\U0001f3e6 <b>Exchange crypto:</b> {exchange_label} Spot | Quote: {quote_currency}\n"
+        f"\U0001f4cc <b>Pares:</b> {crypto_pairs}\n"
         f"\U0001f3f7 <b>Modo:</b> {settings.get('mode', 'paper').upper()} | "
         f"Stage: {settings.get('live_stage', 'stage_10')}\n"
     )
+
+    # Límites dinámicos (solo en live mode)
+    if settings.get("mode", "paper") != "paper":
+        try:
+            from config.loader import get_dynamic_limits, get_live_stage_profile
+            dyn = get_dynamic_limits(current_capital)
+            stage_profile = get_live_stage_profile()
+            risk_pct = float(stage_profile.get("risk_per_trade_pct", 5.0))
+            max_risk_gbp = current_capital * (risk_pct / 100.0)
+            max_pos_size_gbp = (
+                current_capital
+                * (crypto_pct / 100.0)
+                * (dyn["max_position_size_pct"] / 100.0)
+            )
+            stage_leverage = float(stage_profile.get("leverage_max", 1))
+            leveraged_notional = max_pos_size_gbp * stage_leverage
+            notional_label = "spot" if stage_leverage <= 1 else "con apalancamiento"
+            text += (
+                f"\n<b>\U0001f4d0 L\u00edmites ({dyn['tier_label']}):</b>\n"
+                f"   \U0001f3af Riesgo/trade: {risk_pct:.0f}% = GBP {max_risk_gbp:.2f}\n"
+                f"   \U0001f4cf Max posici\u00f3n: {dyn['max_position_size_pct']:.0f}% alloc"
+                f" = GBP {max_pos_size_gbp:.2f}"
+                f" (~GBP {leveraged_notional:.0f} {notional_label})\n"
+                f"   \U0001f522 Posiciones m\u00e1x: {dyn['max_simultaneous_positions']}\n"
+            )
+        except Exception:
+            pass
 
     text += (
         f"\n<b>\U0001f4b8 Asignacion:</b>\n"
@@ -298,7 +374,9 @@ def format_portfolio_status() -> str:
     if realized_pnl != 0:
         real_emoji = "\U0001f7e2" if realized_pnl >= 0 else "\U0001f534"
         real_sign = "+" if realized_pnl >= 0 else ""
-        text += f"   {real_emoji} Trades cerrados: {real_sign}{realized_pnl:,.2f} GBP\n"
+        text += f"   {real_emoji} Trades cerrados neto: {real_sign}{realized_pnl:,.2f} GBP\n"
+    if total_fees:
+        text += f"   \U0001f9fe Fees cerrados: -{total_fees:,.2f} GBP\n"
 
     total_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
     total_sign = "+" if total_pnl >= 0 else ""
@@ -314,12 +392,13 @@ def format_portfolio_status() -> str:
 
 
 def format_open_positions() -> str:
+    exchange_label = _active_exchange_label()
     trades = get_open_trades()
     if not trades:
-        return "\U0001f4ad <b>Sin posiciones abiertas</b>"
+        return f"\U0001f4ad <b>Sin posiciones abiertas en {exchange_label}</b>"
 
-    GBP_PER_USDT = 1.0 / 1.27
-    lines = [f"\U0001f4cb <b>POSICIONES ABIERTAS ({len(trades)})</b>"]
+    lines = [f"\U0001f4cb <b>POSICIONES {exchange_label} ({len(trades)})</b>"]
+    lines.append("<i>Fuente operativa: exchange activo + DB local reconciliada.</i>")
     total_invested = 0.0
     total_pnl = 0.0
 
@@ -331,9 +410,8 @@ def format_open_positions() -> str:
         sl = float(t["stop_loss"])
         tp1 = float(t["take_profit_1"]) if t.get("take_profit_1") else None
 
-        # Margin = what you actually "put in"
-        notional_usd = size * entry
-        margin_gbp = (notional_usd / leverage) * GBP_PER_USDT
+        # Cash/margin committed, expressed in GBP.
+        margin_gbp = _position_value_gbp(t["pair"], size, entry) / leverage
         total_invested += margin_gbp
 
         # Unrealized PnL
@@ -346,7 +424,13 @@ def format_open_positions() -> str:
             total_pnl += gbp
             pnl_emoji = "\U0001f7e2" if gbp >= 0 else "\U0001f534"
             sign = "+" if gbp >= 0 else ""
-            pnl_line = f"   {pnl_emoji} <b>{sign}{gbp:.2f} GBP</b> | Ahora: ${current_price:,.2f}\n"
+            gross = upnl.get("unrealized_pnl_gross_gbp", gbp)
+            fees = upnl.get("estimated_total_fees_gbp", 0.0)
+            pnl_line = (
+                f"   {pnl_emoji} <b>Net {sign}{gbp:.2f} GBP</b> | "
+                f"Gross {gross:+.2f} | Fees -{fees:.2f} | "
+                f"Ahora: {format_price(t['pair'], current_price)}\n"
+            )
         except Exception:
             pass
 
@@ -373,9 +457,135 @@ def format_open_positions() -> str:
     lines.append(
         f"\n{'=' * 24}\n"
         f"\U0001f4b0 Total invertido: GBP {total_invested:,.2f}\n"
-        f"{total_emoji} PnL total: <b>{sign}{total_pnl:.2f} GBP</b>"
+        f"{total_emoji} PnL neto total: <b>{sign}{total_pnl:.2f} GBP</b>"
     )
     return "\n".join(lines)
+
+
+def format_go_live_checklist() -> str:
+    settings = get_settings()
+    crypto_cfg = settings.get("markets", {}).get("crypto", {})
+    exchange = _active_exchange_label()
+    pairs = ", ".join(crypto_cfg.get("pairs", [])) or "N/A"
+    mode = str(settings.get("mode", "paper")).upper()
+    stage = str(settings.get("live_stage", "stage_10"))
+    leverage_max = crypto_cfg.get("leverage_max", 1)
+    allow_short = bool(crypto_cfg.get("allow_short", False))
+
+    return (
+        "\U0001f6e1 <b>GO-LIVE CHECKLIST</b>\n\n"
+        f"Exchange activo: <b>{exchange}</b>\n"
+        f"Modo actual: <b>{mode}</b>\n"
+        f"Stage: <b>{stage}</b>\n"
+        f"Pares: {pairs}\n"
+        f"Leverage max crypto: {leverage_max}x\n"
+        f"Shorts: {'SI' if allow_short else 'NO'}\n\n"
+        "<b>Antes de aceptar GO:</b>\n"
+        "1. GBP disponible en Kraken.\n"
+        "2. Ejecutar /ready y exigir Estado LISTO.\n"
+        "3. Confirmar circuit breaker OK.\n"
+        "4. Confirmar 0 posiciones/ordenes inesperadas.\n"
+        "5. Hacer paper smoke antes de semi_auto.\n"
+        "6. Empezar real solo en stage_10.\n"
+        "7. Confirmar cada trade con GO/SKIP.\n\n"
+        "<b>No hacer:</b>\n"
+        "- No full_auto.\n"
+        "- No margin, futures, withdrawals ni shorts.\n"
+        "- No subir etapa por PnL; solo por estabilidad.\n\n"
+        "<i>Checklist completo: GO_LIVE_CHECKLIST.md y GO_LIVE_RUNBOOK.md</i>"
+    )
+
+
+def format_party_blurb() -> str:
+    """Short plain-language explanation for social situations."""
+    settings = get_settings()
+    crypto_cfg = settings.get("markets", {}).get("crypto", {})
+    exchange = _active_exchange_label()
+    pairs = ", ".join(crypto_cfg.get("pairs", [])) or "BTC/GBP, ETH/GBP, SOL/GBP"
+    mode = str(settings.get("mode", "paper")).upper()
+
+    return (
+        "\U0001f37b <b>Version fiesta del bot</b>\n\n"
+        "Es un bot educativo de trading crypto. Mira precios reales en "
+        f"<b>{exchange}</b> para <b>{pairs}</b>, busca senales con RSI, EMAs, MACD y volumen, "
+        "y cuando ve algo interesante manda una alerta con <b>GO/SKIP</b>.\n\n"
+        f"Ahora esta en <b>{mode}</b>: en paper simula operaciones; si algun dia pasa a real, "
+        "solo opera spot GBP, sin margen, sin shorts, sin withdrawals y con confirmacion manual. "
+        "Tambien calcula fees, PnL neto y usa stops/targets dinamicos por volatilidad."
+    )
+
+
+def _indicator_mark(indicator: dict) -> str:
+    if not indicator.get("triggered"):
+        return "-"
+    signal = indicator.get("signal")
+    if signal == "long":
+        return "L"
+    if signal == "short":
+        return "S"
+    return "ok"
+
+
+def format_scan_report(details: list[dict], approved_signals: list[dict]) -> str:
+    """Format a compact verbose scan report for Telegram."""
+    approved = approved_signals or []
+    lines = [
+        "\U0001f50d <b>SCAN MANUAL</b>",
+        f"Alertas GO/SKIP nuevas: <b>{len(approved)}</b>",
+    ]
+    if approved:
+        lines.append("")
+        for signal in approved:
+            lines.append(
+                f"\U0001f4e1 <b>{signal['pair']} {signal['timeframe']}</b> "
+                f"{signal['direction'].upper()} | {signal.get('signal_count', '?')}/4"
+            )
+
+    lines.append("")
+    lines.append("<b>Detalle bruto:</b>")
+
+    for item in details:
+        pair = item.get("pair", "?")
+        tf = item.get("timeframe", "?")
+        status = item.get("status", "unknown")
+        reason = item.get("reason", "")
+        if status == "error":
+            lines.append(f"\n\u274c <b>{pair} {tf}</b> - {reason}")
+            continue
+
+        price = item.get("price")
+        price_text = f"{float(price):,.2f}" if price else "N/A"
+        trend = str(item.get("trend", "unknown")).upper()
+        vol = item.get("volatility", {})
+        atr = vol.get("atr_pct")
+        atr_text = f"{float(atr):.2f}%" if atr is not None else "N/A"
+
+        rsi = item.get("rsi", {})
+        ema = item.get("ema", {})
+        macd = item.get("macd", {})
+        volume = item.get("volume", {})
+        vol_value = volume.get("value") if isinstance(volume.get("value"), dict) else {}
+        vol_ratio = vol_value.get("ratio")
+        vol_text = f"{float(vol_ratio):.2f}x" if vol_ratio is not None else "N/A"
+
+        icon = "\U0001f7e2" if status == "signal" else "\u26d4" if status == "blocked" else "\u26aa"
+        lines.append(
+            f"\n{icon} <b>{pair} {tf}</b> @ {price_text} | Trend {trend} | ATR {atr_text}"
+        )
+        lines.append(
+            "   "
+            f"RSI {_indicator_mark(rsi)} ({rsi.get('value', 'N/A')}) | "
+            f"EMA {_indicator_mark(ema)} | "
+            f"MACD {_indicator_mark(macd)} | "
+            f"Vol {_indicator_mark(volume)} ({vol_text})"
+        )
+        lines.append(f"   Resultado: {reason}")
+
+    lines.append("\n<i>L=long, S=short, -=sin trigger. Una alerta puede no enviarse si es duplicada o falla riesgo.</i>")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        return text[:3850] + "\n\n<i>Reporte recortado por limite de Telegram.</i>"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +603,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Comandos disponibles:\n"
         "/status - Resumen del portfolio\n"
         "/positions - Posiciones abiertas\n"
+        "/ready - Readiness Kraken antes de operar\n"
+        "/golive - Checklist go-live Kraken\n"
+        "/party - Explicacion rapida del bot\n"
         "/pause - Pausar el sistema\n"
         "/resume - Reanudar el sistema\n"
         "/help - Ayuda\n\n"
@@ -436,11 +649,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "\U0001f4d6 <b>10X Trading Bot - Ayuda</b>\n\n"
         "/status - Resumen del portfolio\n"
-        "/positions - Posiciones abiertas\n"
-        "/force - Comprar YA (ej: /force btc, /force eth, /force sol short)\n"
+        "/positions - Posiciones del exchange activo + DB local\n"
+        "/ready - Readiness, saldo Kraken, posiciones y ordenes\n"
+        "/golive - Checklist operativo antes de pasar a semi_auto\n"
+        "/party - Blurb rapido para explicar el bot\n"
+        "/force - Compra manual controlada (ej: /force btc, /force eth)\n"
         "/test - Trade de prueba con GO/SKIP\n"
         "/scan - Escanear mercados ahora\n"
-        "/ready - Chequeo de readiness y saldo Binance\n"
         "/close - Ver posiciones con boton Cerrar por trade\n"
         "/close 5 - Cerrar trade #5 directamente\n"
         "/closeall - Cerrar TODAS las posiciones (pide confirmacion)\n"
@@ -453,11 +668,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Proteccion automatica:</b>\n"
         "El bot revisa cada 30s si alguna posicion toco su SL o TP.\n"
         "Si tocas /close puedes cerrar manualmente en cualquier momento.\n\n"
+        "<b>Ruta activa UK:</b>\n"
+        "Kraken Spot GBP es la ruta crypto principal. Binance queda solo como codigo legado/fallback, no como ruta activa.\n\n"
         "<i>Modo actual: {mode}</i>".format(
             mode=get_settings().get("mode", "paper").upper()
         ),
         parse_mode="HTML",
     )
+
+
+async def cmd_party(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(format_party_blurb(), parse_mode="HTML")
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -468,9 +689,11 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        from execution.binance_executor import fetch_price
+        from execution.crypto_executor import fetch_ohlcv, fetch_price
         from risk.position_sizer import enrich_signal_with_sizing
         from risk.risk_manager import validate_trade
+        from signals.indicators import analyze, ohlcv_to_dataframe
+        from signals.signal_generator import calculate_exit_levels
         from signals.signal_generator import format_signal_for_telegram
         from data.database import get_latest_equity, save_equity_snapshot
         import uuid
@@ -480,25 +703,32 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             save_equity_snapshot(total_capital=get_settings().get("initial_capital_gbp", 1000))
 
         # Get live price
-        btc_price = fetch_price("BTC/USDT")
+        pair = _normalize_force_pair("BTC")
+        btc_price = fetch_price(pair)
+        ohlcv = fetch_ohlcv(pair, "1h", limit=100)
+        test_analysis = analyze(ohlcv_to_dataframe(ohlcv))
 
         # Build signal
         signal = {
-            "pair": "BTC/USDT",
+            "pair": pair,
             "timeframe": "1h",
             "market": "crypto",
             "direction": "long",
             "entry_price": btc_price,
-            "stop_loss": round(btc_price * 0.98, 2),
-            "take_profit_1": round(btc_price * 1.03, 2),
-            "take_profit_2": round(btc_price * 1.06, 2),
-            "leverage": 5,
+            "leverage": get_settings().get("markets", {}).get("crypto", {}).get("leverage_default", 1),
             "signal_count": 3,
             "min_required": 3,
             "signals_triggered": {"rsi": True, "ema": True, "macd": False, "volume": True},
             "trend": "bullish",
             "strength": "moderate (TEST)",
         }
+        levels = calculate_exit_levels(pair, "1h", "crypto", "long", btc_price, test_analysis)
+        signal.update({
+            "stop_loss": levels["stop_loss"],
+            "take_profit_1": levels["take_profit_1"],
+            "take_profit_2": levels["take_profit_2"],
+            "exit_model": levels["exit_model"],
+        })
 
         # Size and validate
         signal = enrich_signal_with_sizing(signal)
@@ -562,14 +792,23 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    crypto_cfg = get_settings().get("markets", {}).get("crypto", {})
+    if direction == "short" and crypto_cfg.get("allow_short", True) is False:
+        await update.message.reply_text(
+            "\u274c <b>Short no disponible:</b> Kraken Spot solo permite compras/ventas spot sin margen.",
+            parse_mode="HTML",
+        )
+        return
+
     await update.message.reply_text(
         f"\U0001f50e <b>Analizando {pair}...</b>",
         parse_mode="HTML",
     )
 
     try:
-        from execution.binance_executor import fetch_price, fetch_ohlcv
+        from execution.crypto_executor import fetch_ohlcv, fetch_price
         from signals.indicators import ohlcv_to_dataframe, analyze
+        from signals.signal_generator import calculate_exit_levels
         from risk.position_sizer import enrich_signal_with_sizing
         from data.database import calculate_current_equity
         import uuid
@@ -607,15 +846,10 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         }.get(trend.get("trend"), "\u26aa DESCONOCIDA")
         change_icon = "\U0001f4c8" if change_24h >= 0 else "\U0001f4c9"
 
-        # Calculate 3 position sizes
-        if direction == "long":
-            sl = round(price * 0.98, 2)
-            tp1 = round(price * 1.03, 2)
-            tp2 = round(price * 1.06, 2)
-        else:
-            sl = round(price * 1.02, 2)
-            tp1 = round(price * 0.97, 2)
-            tp2 = round(price * 0.94, 2)
+        levels = calculate_exit_levels(pair, "1h", "crypto", direction, price, analysis)
+        sl = levels["stop_loss"]
+        tp1 = levels["take_profit_1"]
+        tp2 = levels["take_profit_2"]
 
         capital = calculate_current_equity()
         dir_emoji = "\U0001f7e2" if direction == "long" else "\U0001f534"
@@ -629,6 +863,7 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "stop_loss": sl,
             "take_profit_1": tp1,
             "take_profit_2": tp2,
+            "exit_model": levels["exit_model"],
             "signal_count": 4,
             "min_required": 3,
             "signals_triggered": {"manual": True},
@@ -636,35 +871,84 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "strength": "manual",
         }
 
-        sig_safe = enrich_signal_with_sizing({
-            **base_signal,
-            "leverage": 5,
-            "size_scale": 0.4,
-            "size_profile": "safe",
-        })
-        sig_med = enrich_signal_with_sizing({
-            **base_signal,
-            "leverage": 10,
-            "size_scale": 1.0,
-            "size_profile": "medium",
-        })
+        max_leverage = max(1, int(crypto_cfg.get("leverage_max", crypto_cfg.get("leverage_default", 1)) or 1))
+        default_leverage = max(1, min(int(crypto_cfg.get("leverage_default", 1) or 1), max_leverage))
+        profiles = [
+            {
+                "label": "Spot" if max_leverage == 1 else "Seguro",
+                "emoji": "\u2705",
+                "leverage": default_leverage,
+                "scale": 1.0 if max_leverage == 1 else 0.4,
+                "profile": "spot" if max_leverage == 1 else "safe",
+            }
+        ]
+        if max_leverage > default_leverage:
+            profiles.append({
+                "label": "Medio",
+                "emoji": "\U0001f525",
+                "leverage": max_leverage,
+                "scale": 1.0,
+                "profile": "medium",
+            })
 
-        if not sig_safe.get("sizing_approved", False) and not sig_med.get("sizing_approved", False):
+        sized_options = []
+        for profile in profiles:
+            sized = enrich_signal_with_sizing({
+                **base_signal,
+                "leverage": profile["leverage"],
+                "size_scale": profile["scale"],
+                "size_profile": profile["profile"],
+            })
+            if sized.get("sizing_approved", False):
+                sized_options.append((profile, sized))
+
+        if not sized_options:
             await update.message.reply_text(
                 "\u26d4 <b>No se pudo calcular un tamano valido para este activo.</b>",
                 parse_mode="HTML",
             )
             return
 
-        margin_safe = sig_safe["margin_required"]
-        margin_med = sig_med["margin_required"]
-        value_safe = sig_safe["position_size_value"]
-        value_med = sig_med["position_size_value"]
+        option_lines = []
+        keyboard_rows = []
+        skip_id = None
+        for profile, signal in sized_options:
+            signal_id = f"force_{profile['profile']}_{uuid.uuid4().hex[:6]}"
+            if skip_id is None:
+                skip_id = signal_id
+            _pending_signals[signal_id] = signal
+            margin = signal["margin_required"]
+            value = signal["position_size_value"]
+            round_trip_fee = float(signal.get("estimated_round_trip_fee_gbp", 0.0))
+            breakeven = float(signal.get("fee_breakeven_pct", 0.0))
+            option_lines.append(
+                f"{profile['emoji']} <b>{profile['label']}</b> ({profile['leverage']}x) - "
+                f"Pones <b>GBP {margin:,.0f}</b> -> Posicion GBP {value:,.0f} | "
+                f"Fees est. GBP {round_trip_fee:,.2f} | "
+                f"Break-even {breakeven:.2f}% | "
+                f"Pierdes max GBP {signal['risk_gbp']:,.0f}"
+            )
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    f"{profile['emoji']} {profile['label']} ({profile['leverage']}x) - GBP {margin:,.0f}",
+                    callback_data=f"go:{signal_id}",
+                )
+            ])
+        keyboard_rows.append([InlineKeyboardButton("\u23ed No comprar", callback_data=f"skip:{skip_id}")])
+        exit_model = levels.get("exit_model", {})
+        exit_desc = ""
+        if exit_model.get("type") == "paper_atr":
+            exit_desc = (
+                f"\U0001f4d0 <b>Salida paper ATR:</b> "
+                f"SL {float(exit_model.get('stop_loss_pct', 0)):.2f}% | "
+                f"TP1 {float(exit_model.get('take_profit_1_pct', 0)):.2f}% | "
+                f"TP2 {float(exit_model.get('take_profit_2_pct', 0)):.2f}%\n"
+            )
 
         info_text = (
             f"{dir_emoji} <b>{pair} — {direction.upper()}</b>\n"
             f"\n"
-            f"\U0001f4b0 <b>Precio:</b> ${price:,.2f}\n"
+            f"\U0001f4b0 <b>Precio:</b> {format_price(pair, price)}\n"
             f"{change_icon} <b>24h:</b> {change_24h:+.2f}%\n"
             f"\U0001f4c8 <b>Tendencia:</b> {trend_icon}\n"
             f"\n"
@@ -674,40 +958,17 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"  {macd_icon} MACD: {'cruce ' + (macd.get('signal') or 'sin cruce').upper() if macd.get('signal') else 'sin cruce'}\n"
             f"  {vol_icon} Volumen: {vol_ratio}x vs promedio\n"
             f"\n"
-            f"\U0001f6d1 <b>Stop-Loss:</b> ${sl:,.2f} (-2%)\n"
-            f"\U0001f3af <b>TP1:</b> ${tp1:,.2f} (+3%) | <b>TP2:</b> ${tp2:,.2f} (+6%)\n"
+            f"\U0001f6d1 <b>Stop-Loss:</b> {format_price(pair, sl)}\n"
+            f"\U0001f3af <b>TP1:</b> {format_price(pair, tp1)} | <b>TP2:</b> {format_price(pair, tp2)}\n"
+            f"{exit_desc}"
             f"\n"
             f"\U0001f4b7 <b>Capital actual:</b> GBP {capital:,.0f}\n"
             f"\n"
             f"<b>Elige tamano:</b>\n\n"
-            f"\u2705 <b>Seguro</b> (5x) - Pones <b>GBP {margin_safe:,.0f}</b> -> Posicion GBP {value_safe:,.0f} | Pierdes max GBP {sig_safe['risk_gbp']:,.0f}\n"
-            f"\U0001f525 <b>Medio</b> (10x) - Pones <b>GBP {margin_med:,.0f}</b> -> Posicion GBP {value_med:,.0f} | Pierdes max GBP {sig_med['risk_gbp']:,.0f}"
+            + "\n".join(option_lines)
         )
 
-        # Store signals for each button (risk validation happens again on GO)
-        id_safe = f"force_safe_{uuid.uuid4().hex[:6]}"
-        id_med = f"force_med_{uuid.uuid4().hex[:6]}"
-
-        _pending_signals[id_safe] = sig_safe
-        _pending_signals[id_med] = sig_med
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    f"\u2705 Seguro (5x) \u2014 GBP {margin_safe:,.0f}",
-                    callback_data=f"go:{id_safe}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    f"\U0001f525 Medio (10x) \u2014 GBP {margin_med:,.0f}",
-                    callback_data=f"go:{id_med}",
-                ),
-            ],
-            [
-                InlineKeyboardButton("\u23ed No comprar", callback_data=f"skip:{id_safe}"),
-            ],
-        ])
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
 
         await update.message.reply_text(info_text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -727,21 +988,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         from pipeline import run_scan_cycle
+        from signals.scanner import scan_diagnostics
+        details = scan_diagnostics()
         signals = run_scan_cycle()
-
-        if signals:
-            text = f"\U0001f4e1 <b>{len(signals)} senal(es) detectada(s)!</b>\n\n"
-            for s in signals:
-                text += f"  - {s['pair']} ({s['timeframe']}) {s['direction'].upper()}\n"
-            text += "\n<i>Las alertas con GO/SKIP se enviaron arriba.</i>"
-        else:
-            text = (
-                "\U0001f4ad <b>Sin senales en este momento.</b>\n\n"
-                "Los 3 pares (BTC, ETH, SOL) fueron analizados en 1h y 4h.\n"
-                "Ninguno tiene 3/4 indicadores alineados ahora.\n\n"
-                "<i>El scanner automatico revisa cada 5 minutos.</i>"
-            )
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(format_scan_report(details, signals), parse_mode="HTML")
 
     except Exception as e:
         await update.message.reply_text(
@@ -751,7 +1001,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show operational readiness and current Binance balance snapshot."""
+    """Show operational readiness and current exchange balance snapshot."""
     try:
         from notifications.report_generator import generate_readiness_report
         import concurrent.futures
@@ -765,6 +1015,11 @@ async def cmd_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\u274c <b>Error:</b> {e}",
             parse_mode="HTML",
         )
+
+
+async def cmd_golive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the short go-live checklist for Kraken Spot."""
+    await update.message.reply_text(format_go_live_checklist(), parse_mode="HTML")
 
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -800,6 +1055,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             pnl = result.get("pnl_gbp", 0)
             pnl_pct = result.get("pnl_pct", 0)
+            gross = result.get("pnl_gross_gbp", pnl)
+            fees = result.get("total_fees_gbp", 0.0)
             pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
             sign = "+" if pnl >= 0 else ""
             direction_emoji = "\U0001f7e2" if result.get("direction") == "long" else "\U0001f534"
@@ -811,7 +1068,9 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"\U0001f4b0 Entrada: {result.get('entry_price', 0):,.2f}\n"
                 f"\U0001f3c1 Salida: {result.get('exit_price', 0):,.2f}\n"
                 f"\n"
-                f"PnL: <b>{sign}{pnl:.2f} GBP ({sign}{pnl_pct:.1f}%)</b>",
+                f"Gross: {gross:+.2f} GBP\n"
+                f"Fees: -{fees:.2f} GBP\n"
+                f"Net: <b>{sign}{pnl:.2f} GBP ({sign}{pnl_pct:.1f}%)</b>",
                 parse_mode="HTML",
             )
             log_info("telegram", f"Trade #{trade_id} closed manually via /close command")
@@ -832,7 +1091,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    lines = ["\U0001f4cb <b>POSICIONES ABIERTAS</b>\n"]
+    exchange_label = _active_exchange_label()
+    lines = [f"\U0001f4cb <b>POSICIONES {exchange_label} ABIERTAS</b>\n"]
     keyboard_rows = []
 
     for i, t in enumerate(trades, start=1):
@@ -948,6 +1208,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             pnl = result.get("pnl_gbp", 0)
             pnl_pct = result.get("pnl_pct", 0)
+            gross = result.get("pnl_gross_gbp", pnl)
+            fees = result.get("total_fees_gbp", 0.0)
             pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
             sign = "+" if pnl >= 0 else ""
             direction_emoji = "\U0001f7e2" if result.get("direction") == "long" else "\U0001f534"
@@ -959,7 +1221,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"\U0001f4b0 Entrada: {result.get('entry_price', 0):,.2f}\n"
                 f"\U0001f3c1 Salida: {result.get('exit_price', 0):,.2f}\n"
                 f"\n"
-                f"PnL: <b>{sign}{pnl:.2f} GBP ({sign}{pnl_pct:.1f}%)</b>",
+                f"Gross: {gross:+.2f} GBP\n"
+                f"Fees: -{fees:.2f} GBP\n"
+                f"Net: <b>{sign}{pnl:.2f} GBP ({sign}{pnl_pct:.1f}%)</b>",
                 parse_mode="HTML",
             )
             log_info("telegram", f"Trade #{trade_id} closed manually via inline button")
@@ -1024,6 +1288,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     return
 
                 total_pnl = sum(r.get("pnl_gbp", 0) for r in results if r.get("success"))
+                total_fees = sum(r.get("total_fees_gbp", 0) for r in results if r.get("success"))
                 total_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
                 sign = "+" if total_pnl >= 0 else ""
 
@@ -1034,17 +1299,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         continue
                     pnl = r.get("pnl_gbp", 0)
                     pnl_pct = r.get("pnl_pct", 0)
+                    fees = r.get("total_fees_gbp", 0.0)
                     pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
                     r_sign = "+" if pnl >= 0 else ""
                     direction_emoji = "\U0001f7e2" if r.get("direction") == "long" else "\U0001f534"
                     lines.append(
                         f"{direction_emoji} <b>{r['pair']}</b> {r.get('direction', '').upper()} "
                         f"@ {r.get('entry_price', 0):,.2f} -> {r.get('exit_price', 0):,.2f} | "
-                        f"{pnl_emoji} {r_sign}{pnl:.2f} GBP ({r_sign}{pnl_pct:.1f}%)"
+                        f"Fees -{fees:.2f} | Net {pnl_emoji} {r_sign}{pnl:.2f} GBP ({r_sign}{pnl_pct:.1f}%)"
                     )
 
                 lines.append(
-                    f"\n{total_emoji} <b>PnL total: {sign}{total_pnl:.2f} GBP</b>"
+                    f"\n\U0001f9fe Fees total: -{total_fees:.2f} GBP\n"
+                    f"{total_emoji} <b>PnL neto total: {sign}{total_pnl:.2f} GBP</b>"
                 )
                 await query.message.reply_text(
                     "\n".join(lines),
@@ -1201,6 +1468,9 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("force", cmd_force))
     _app.add_handler(CommandHandler("scan", cmd_scan))
     _app.add_handler(CommandHandler("ready", cmd_ready))
+    _app.add_handler(CommandHandler("golive", cmd_golive))
+    _app.add_handler(CommandHandler("checklist", cmd_golive))
+    _app.add_handler(CommandHandler("party", cmd_party))
     _app.add_handler(CommandHandler("pause", cmd_pause))
     _app.add_handler(CommandHandler("resume", cmd_resume))
     _app.add_handler(CommandHandler("close", cmd_close))
@@ -1285,7 +1555,7 @@ if __name__ == "__main__":
         # Send a sample signal alert
         print("Enviando alerta de ejemplo...")
         sample_signal = {
-            "pair": "BTC/USDT",
+            "pair": _normalize_force_pair("BTC"),
             "direction": "long",
             "entry_price": 67450.00,
             "stop_loss": 66100.00,

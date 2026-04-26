@@ -1,5 +1,5 @@
 """
-Force a test trade through the full pipeline.
+Force a paper test trade through the full Kraken-configured pipeline.
 Sends a real alert to Telegram with GO/SKIP buttons.
 If you tap GO, it executes a paper trade and records it in the database.
 
@@ -18,10 +18,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 from config.loader import get_secrets, get_settings
 from data.database import init_db, save_equity_snapshot, get_latest_equity, get_open_trades
-from execution.binance_executor import fetch_price
+from execution.crypto_executor import fetch_ohlcv, fetch_price, format_price
 from risk.position_sizer import enrich_signal_with_sizing
 from risk.risk_manager import validate_trade
 from pipeline import execute_signal
+from signals.indicators import analyze, ohlcv_to_dataframe
+from signals.signal_generator import calculate_exit_levels
 from notifications.telegram_bot import format_signal_alert
 
 # Init
@@ -50,30 +52,46 @@ def get_updates(offset=None):
     return json.loads(resp.read())
 
 print("=" * 50)
-print("  FORCE TEST TRADE")
+print("  FORCE PAPER TEST TRADE")
 print("=" * 50)
 
+settings = get_settings()
+mode = settings.get("mode", "paper")
+if mode != "paper":
+    print("\nEste smoke test solo corre en mode: paper.")
+    print(f"Modo actual: {mode}")
+    print("Cambia config/settings.yaml a mode: paper antes de usar FORCE_TEST_TRADE.bat.")
+    exit(1)
+
+crypto_cfg = settings.get("markets", {}).get("crypto", {})
+pair = (crypto_cfg.get("pairs") or ["BTC/GBP"])[0]
+leverage = int(crypto_cfg.get("leverage_default", 1) or 1)
+leverage = max(1, min(leverage, int(crypto_cfg.get("leverage_max", 1) or 1)))
+
 # 1. Get live price
-print("\nObteniendo precio de BTC...")
-btc_price = fetch_price("BTC/USDT")
-print(f"BTC/USDT: ${btc_price:,.2f}")
+print(f"\nObteniendo precio de {pair}...")
+entry_price = fetch_price(pair)
+print(f"{pair}: {format_price(pair, entry_price)}")
+analysis = analyze(ohlcv_to_dataframe(fetch_ohlcv(pair, "1h", limit=100)))
+levels = calculate_exit_levels(pair, "1h", "crypto", "long", entry_price, analysis)
 
 # 2. Build signal
 signal = {
-    "pair": "BTC/USDT",
+    "pair": pair,
     "timeframe": "1h",
     "market": "crypto",
     "direction": "long",
-    "entry_price": btc_price,
-    "stop_loss": round(btc_price * 0.98, 2),
-    "take_profit_1": round(btc_price * 1.03, 2),
-    "take_profit_2": round(btc_price * 1.06, 2),
-    "leverage": 5,
+    "entry_price": entry_price,
+    "stop_loss": levels["stop_loss"],
+    "take_profit_1": levels["take_profit_1"],
+    "take_profit_2": levels["take_profit_2"],
+    "exit_model": levels["exit_model"],
+    "leverage": leverage,
     "signal_count": 3,
     "min_required": 3,
     "signals_triggered": {"rsi": True, "ema": True, "macd": False, "volume": True},
     "trend": "bullish",
-    "strength": "moderate",
+    "strength": "moderate (PAPER TEST)",
 }
 
 # 3. Size it
@@ -140,18 +158,19 @@ while True:
                 result = execute_signal(signal)
                 print(f"\nTrade ejecutado:")
                 print(f"  Pair:    {result.get('pair', signal['pair'])}")
-                print(f"  Entry:   ${result.get('entry_price', 0):,.2f}")
-                print(f"  SL:      ${signal['stop_loss']:,.2f}")
-                print(f"  TP1:     ${signal['take_profit_1']:,.2f}")
-                print(f"  TP2:     ${signal['take_profit_2']:,.2f}")
+                print(f"  Entry:   {format_price(pair, result.get('entry_price', 0))}")
+                print(f"  SL:      {format_price(pair, signal['stop_loss'])}")
+                print(f"  TP1:     {format_price(pair, signal['take_profit_1'])}")
+                print(f"  TP2:     {format_price(pair, signal['take_profit_2'])}")
                 print(f"  TradeID: #{result.get('trade_id')}")
 
                 # Send confirmation
                 send_telegram(
                     f"\u2705 <b>TRADE EJECUTADO (PAPER)</b>\n\n"
-                    f"BTC/USDT LONG @ ${result.get('entry_price', 0):,.2f}\n"
-                    f"SL: ${signal['stop_loss']:,.2f} | TP1: ${signal['take_profit_1']:,.2f}\n"
-                    f"Size: {signal['position_size']:.6f} BTC | Lev: {signal['leverage']}x\n\n"
+                    f"{pair} LONG @ {format_price(pair, result.get('entry_price', 0))}\n"
+                    f"SL: {format_price(pair, signal['stop_loss'])} | "
+                    f"TP1: {format_price(pair, signal['take_profit_1'])}\n"
+                    f"Size: {signal['position_size']:.6f} | Lev: {signal['leverage']}x\n\n"
                     f"Trade #{result.get('trade_id')} registrado en la base de datos."
                 )
 

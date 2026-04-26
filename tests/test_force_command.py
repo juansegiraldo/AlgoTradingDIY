@@ -30,6 +30,19 @@ def test_normalize_force_pair_rejects_unknown_symbol(monkeypatch):
         telegram_bot._normalize_force_pair("xrp")
 
 
+def test_normalize_force_pair_accepts_gbp_aliases(monkeypatch):
+    monkeypatch.setattr(
+        telegram_bot,
+        "get_settings",
+        lambda: {"markets": {"crypto": {"pairs": ["BTC/GBP", "ETH/GBP", "SOL/GBP"]}}},
+    )
+
+    assert telegram_bot._normalize_force_pair(None) == "BTC/GBP"
+    assert telegram_bot._normalize_force_pair("eth") == "ETH/GBP"
+    assert telegram_bot._normalize_force_pair("solgbp") == "SOL/GBP"
+    assert telegram_bot._normalize_force_pair("btc/gbp") == "BTC/GBP"
+
+
 def test_enrich_signal_with_sizing_respects_size_scale(monkeypatch):
     monkeypatch.setattr(
         position_sizer,

@@ -116,6 +116,11 @@ def evaluate_signal(
         direction = "short"
         signal_count = short_count
 
+    market_cfg = get_settings().get("markets", {}).get(market, {})
+    if direction == "short" and market_cfg.get("allow_short", True) is False:
+        logger.info(f"{pair} ({timeframe}): Short signal skipped because shorts are disabled")
+        return None
+
     if direction is None:
         logger.debug(
             f"{pair} ({timeframe}): No signal. "
@@ -129,21 +134,19 @@ def evaluate_signal(
         logger.warning(f"{pair}: Cannot generate signal — no valid price")
         return None
 
-    sl_pct = pm.get("stop_loss_pct", 2.0) / 100.0
-    tp1_pct = pm.get("take_profit_1_pct", 3.0) / 100.0
-    tp2_pct = pm.get("take_profit_2_pct", 6.0) / 100.0
-
-    if direction == "long":
-        stop_loss = round(price * (1 - sl_pct), 8)
-        tp1 = round(price * (1 + tp1_pct), 8)
-        tp2 = round(price * (1 + tp2_pct), 8)
-    else:
-        stop_loss = round(price * (1 + sl_pct), 8)
-        tp1 = round(price * (1 - tp1_pct), 8)
-        tp2 = round(price * (1 - tp2_pct), 8)
+    levels = calculate_exit_levels(
+        pair=pair,
+        timeframe=timeframe,
+        market=market,
+        direction=direction,
+        price=price,
+        analysis=analysis,
+    )
+    stop_loss = levels["stop_loss"]
+    tp1 = levels["take_profit_1"]
+    tp2 = levels["take_profit_2"]
 
     # Determine leverage from market settings
-    market_cfg = get_settings().get("markets", {}).get(market, {})
     leverage = market_cfg.get("leverage_default", 1)
 
     signal = {
@@ -156,6 +159,7 @@ def evaluate_signal(
         "stop_loss": stop_loss,
         "take_profit_1": tp1,
         "take_profit_2": tp2,
+        "exit_model": levels["exit_model"],
         "leverage": leverage,
         "signal_count": signal_count,
         "min_required": min_signals,
@@ -188,6 +192,114 @@ def _get_last_price(analysis: dict) -> Optional[float]:
     return None
 
 
+def _timeframe_minutes(timeframe: str) -> int:
+    raw = str(timeframe).strip().lower()
+    if raw.endswith("m"):
+        return int(raw[:-1])
+    if raw.endswith("h"):
+        return int(raw[:-1]) * 60
+    if raw.endswith("d"):
+        return int(raw[:-1]) * 60 * 24
+    return 60
+
+
+def _timeframe_floor_pct(timeframe: str, floors: dict, default: float) -> float:
+    if timeframe in floors:
+        return float(floors[timeframe])
+    minutes = _timeframe_minutes(timeframe)
+    if minutes <= 60:
+        return float(floors.get("1h", default))
+    if minutes <= 240:
+        return float(floors.get("4h", default))
+    return float(default)
+
+
+def _use_paper_atr_exits(market: str) -> bool:
+    settings = get_settings()
+    if settings.get("mode", "paper") != "paper":
+        return False
+    if market != "crypto":
+        return False
+    profile = settings.get("position_management", {}).get("paper_crypto_atr", {})
+    return bool(profile.get("enabled", False))
+
+
+def calculate_exit_levels(
+    pair: str,
+    timeframe: str,
+    market: str,
+    direction: str,
+    price: float,
+    analysis: Optional[dict] = None,
+) -> dict:
+    """Calculate stop-loss and take-profit levels for a signal."""
+    settings = get_settings()
+    pm = settings.get("position_management", {})
+
+    if _use_paper_atr_exits(market):
+        profile = pm.get("paper_crypto_atr", {})
+        volatility = (analysis or {}).get("volatility", {})
+        atr_pct = volatility.get("atr_pct")
+        try:
+            atr_pct = float(atr_pct)
+        except (TypeError, ValueError):
+            atr_pct = 0.0
+
+        fixed_floor = float(pm.get("stop_loss_pct", 2.0))
+        floors = profile.get("min_stop_loss_pct_by_timeframe", {})
+        min_stop_pct = _timeframe_floor_pct(timeframe, floors, fixed_floor)
+        atr_mult = float(profile.get("atr_stop_multiplier", 2.5))
+        max_stop_pct = float(profile.get("max_stop_loss_pct", 8.0))
+        stop_pct = max(min_stop_pct, atr_pct * atr_mult)
+        stop_pct = min(stop_pct, max_stop_pct)
+        tp1_r = float(profile.get("tp1_r_multiple", 1.5))
+        tp2_r = float(profile.get("tp2_r_multiple", 2.5))
+        tp1_pct = stop_pct * tp1_r
+        tp2_pct = stop_pct * tp2_r
+        model = {
+            "type": "paper_atr",
+            "atr_pct": round(atr_pct, 4),
+            "atr_stop_multiplier": atr_mult,
+            "stop_loss_pct": round(stop_pct, 4),
+            "tp1_r_multiple": tp1_r,
+            "tp2_r_multiple": tp2_r,
+            "take_profit_1_pct": round(tp1_pct, 4),
+            "take_profit_2_pct": round(tp2_pct, 4),
+        }
+    else:
+        stop_pct = float(pm.get("stop_loss_pct", 2.0))
+        tp1_pct = float(pm.get("take_profit_1_pct", 3.0))
+        tp2_pct = float(pm.get("take_profit_2_pct", 6.0))
+        model = {
+            "type": "fixed_pct",
+            "stop_loss_pct": round(stop_pct, 4),
+            "take_profit_1_pct": round(tp1_pct, 4),
+            "take_profit_2_pct": round(tp2_pct, 4),
+        }
+
+    sl_fraction = stop_pct / 100.0
+    tp1_fraction = tp1_pct / 100.0
+    tp2_fraction = tp2_pct / 100.0
+
+    if direction == "long":
+        stop_loss = round(price * (1 - sl_fraction), 8)
+        tp1 = round(price * (1 + tp1_fraction), 8)
+        tp2 = round(price * (1 + tp2_fraction), 8)
+    else:
+        stop_loss = round(price * (1 + sl_fraction), 8)
+        tp1 = round(price * (1 - tp1_fraction), 8)
+        tp2 = round(price * (1 - tp2_fraction), 8)
+
+    return {
+        "pair": pair,
+        "timeframe": timeframe,
+        "stop_loss": stop_loss,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "exit_model": model,
+    }
+
+
 def _classify_strength(signal_count: int, min_required: int) -> str:
     """Classify signal strength."""
     if signal_count >= 4:
@@ -214,6 +326,7 @@ def format_signal_for_telegram(signal: dict, risk_gbp: float = 0, risk_pct: floa
         "stop_loss": signal["stop_loss"],
         "take_profit_1": signal["take_profit_1"],
         "take_profit_2": signal["take_profit_2"],
+        "exit_model": signal.get("exit_model", {}),
         "position_size": position_size,
         "risk_gbp": round(risk_gbp, 2),
         "risk_pct": round(risk_pct, 2),

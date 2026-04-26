@@ -29,8 +29,14 @@ CREATE TABLE IF NOT EXISTS trades (
     remaining_size REAL,
     tp1_hit_at TEXT,
     leverage REAL DEFAULT 1,
+    entry_fee_gbp REAL DEFAULT 0,
+    exit_fee_gbp REAL DEFAULT 0,
+    total_fees_gbp REAL DEFAULT 0,
+    realized_partial_pnl_gbp REAL DEFAULT 0,
+    pnl_gross_gbp REAL,
     pnl_absolute REAL,
     pnl_percent REAL,
+    fee_details_json TEXT,
     status TEXT DEFAULT 'open',
     signals_triggered TEXT,
     mode TEXT DEFAULT 'paper',
@@ -46,7 +52,12 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     etf_capital REAL,
     open_positions INTEGER,
     daily_pnl REAL,
-    weekly_pnl REAL
+    weekly_pnl REAL,
+    mode TEXT DEFAULT 'paper',
+    source TEXT DEFAULT 'internal',
+    free_balance_gbp REAL,
+    margin_used_gbp REAL,
+    metadata_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS system_logs (
@@ -95,6 +106,30 @@ def init_db() -> None:
             conn.execute("ALTER TABLE trades ADD COLUMN remaining_size REAL")
         if "tp1_hit_at" not in columns:
             conn.execute("ALTER TABLE trades ADD COLUMN tp1_hit_at TEXT")
+        if "entry_fee_gbp" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN entry_fee_gbp REAL DEFAULT 0")
+        if "exit_fee_gbp" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN exit_fee_gbp REAL DEFAULT 0")
+        if "total_fees_gbp" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN total_fees_gbp REAL DEFAULT 0")
+        if "realized_partial_pnl_gbp" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN realized_partial_pnl_gbp REAL DEFAULT 0")
+        if "pnl_gross_gbp" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN pnl_gross_gbp REAL")
+        if "fee_details_json" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN fee_details_json TEXT")
+        cursor = conn.execute("PRAGMA table_info(equity_snapshots)")
+        eq_columns = {row[1] for row in cursor.fetchall()}
+        if "mode" not in eq_columns:
+            conn.execute("ALTER TABLE equity_snapshots ADD COLUMN mode TEXT DEFAULT 'paper'")
+        if "source" not in eq_columns:
+            conn.execute("ALTER TABLE equity_snapshots ADD COLUMN source TEXT DEFAULT 'internal'")
+        if "free_balance_gbp" not in eq_columns:
+            conn.execute("ALTER TABLE equity_snapshots ADD COLUMN free_balance_gbp REAL")
+        if "margin_used_gbp" not in eq_columns:
+            conn.execute("ALTER TABLE equity_snapshots ADD COLUMN margin_used_gbp REAL")
+        if "metadata_json" not in eq_columns:
+            conn.execute("ALTER TABLE equity_snapshots ADD COLUMN metadata_json TEXT")
 
 
 def _now() -> str:
@@ -119,22 +154,28 @@ def open_trade(
     signals_triggered: Optional[dict] = None,
     mode: str = "paper",
     notes: Optional[str] = None,
+    entry_fee_gbp: float = 0.0,
+    fee_details: Optional[dict] = None,
 ) -> int:
     sql = """
     INSERT INTO trades
         (timestamp_open, market, pair, direction, entry_price, stop_loss,
          position_size, leverage, take_profit_1, take_profit_2,
-         signals_triggered, mode, notes, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+         signals_triggered, mode, notes, entry_fee_gbp, total_fees_gbp,
+         fee_details_json, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
     """
     signals_json = json.dumps(signals_triggered) if signals_triggered else None
+    fee_details_json = json.dumps(fee_details) if fee_details else None
+    entry_fee = float(entry_fee_gbp or 0.0)
     with get_connection() as conn:
         cur = conn.execute(
             sql,
             (
                 _now(), market, pair, direction, entry_price, stop_loss,
                 position_size, leverage, take_profit_1, take_profit_2,
-                signals_json, mode, notes,
+                signals_json, mode, notes, entry_fee, entry_fee,
+                fee_details_json,
             ),
         )
         return cur.lastrowid
@@ -146,15 +187,93 @@ def close_trade(
     status: str,
     pnl_absolute: float,
     pnl_percent: float,
+    *,
+    pnl_gross_gbp: Optional[float] = None,
+    exit_fee_gbp: float = 0.0,
+    fee_details: Optional[dict] = None,
 ) -> None:
     sql = """
     UPDATE trades
     SET timestamp_close = ?, exit_price = ?, status = ?,
-        pnl_absolute = ?, pnl_percent = ?
+        pnl_gross_gbp = ?, pnl_absolute = ?, pnl_percent = ?,
+        exit_fee_gbp = ?, total_fees_gbp = ?, fee_details_json = ?
     WHERE id = ?
     """
     with get_connection() as conn:
-        conn.execute(sql, (_now(), exit_price, status, pnl_absolute, pnl_percent, trade_id))
+        existing = conn.execute(
+            """
+            SELECT entry_fee_gbp, exit_fee_gbp, realized_partial_pnl_gbp, fee_details_json
+            FROM trades WHERE id = ?
+            """,
+            (trade_id,),
+        ).fetchone()
+        entry_fee = float((existing["entry_fee_gbp"] if existing else 0.0) or 0.0)
+        previous_exit_fee = float((existing["exit_fee_gbp"] if existing else 0.0) or 0.0)
+        partial_gross_pnl = float((existing["realized_partial_pnl_gbp"] if existing else 0.0) or 0.0)
+        exit_fee_total = previous_exit_fee + float(exit_fee_gbp or 0.0)
+        total_fees = entry_fee + exit_fee_total
+        closing_gross_pnl = float(pnl_gross_gbp if pnl_gross_gbp is not None else pnl_absolute)
+        gross_pnl = partial_gross_pnl + closing_gross_pnl
+        net_pnl = gross_pnl - total_fees
+        if fee_details is None and existing and existing["fee_details_json"]:
+            fee_details_json = existing["fee_details_json"]
+        else:
+            fee_details_json = json.dumps(fee_details) if fee_details else None
+
+        conn.execute(
+            sql,
+            (
+                _now(), exit_price, status,
+                round(gross_pnl, 6), round(net_pnl, 6), pnl_percent,
+                round(exit_fee_total, 6), round(total_fees, 6), fee_details_json,
+                trade_id,
+            ),
+        )
+
+
+def add_trade_exit_fee(
+    trade_id: int,
+    exit_fee_gbp: float,
+    realized_pnl_gbp: float = 0.0,
+    fee_details: Optional[dict] = None,
+) -> None:
+    """Accumulate exit fees and realized gross PnL after a partial close."""
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT entry_fee_gbp, exit_fee_gbp, realized_partial_pnl_gbp, fee_details_json
+            FROM trades WHERE id = ?
+            """,
+            (trade_id,),
+        ).fetchone()
+        if existing is None:
+            return
+        entry_fee = float(existing["entry_fee_gbp"] or 0.0)
+        exit_fee_total = float(existing["exit_fee_gbp"] or 0.0) + float(exit_fee_gbp or 0.0)
+        partial_pnl = (
+            float(existing["realized_partial_pnl_gbp"] or 0.0)
+            + float(realized_pnl_gbp or 0.0)
+        )
+        total_fees = entry_fee + exit_fee_total
+        if fee_details is None and existing["fee_details_json"]:
+            fee_details_json = existing["fee_details_json"]
+        else:
+            fee_details_json = json.dumps(fee_details) if fee_details else existing["fee_details_json"]
+        conn.execute(
+            """
+            UPDATE trades
+            SET exit_fee_gbp = ?, total_fees_gbp = ?,
+                realized_partial_pnl_gbp = ?, fee_details_json = ?
+            WHERE id = ?
+            """,
+            (
+                round(exit_fee_total, 6),
+                round(total_fees, 6),
+                round(partial_pnl, 6),
+                fee_details_json,
+                trade_id,
+            ),
+        )
 
 
 def update_tp1_state(trade_id: int, remaining_size: float) -> None:
@@ -224,18 +343,26 @@ def save_equity_snapshot(
     open_positions: int = 0,
     daily_pnl: float = 0.0,
     weekly_pnl: float = 0.0,
+    mode: str = "paper",
+    source: str = "internal",
+    free_balance_gbp: Optional[float] = None,
+    margin_used_gbp: Optional[float] = None,
+    metadata: Optional[dict] = None,
 ) -> int:
     sql = """
     INSERT INTO equity_snapshots
         (timestamp, total_capital, crypto_capital, forex_capital,
-         etf_capital, open_positions, daily_pnl, weekly_pnl)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         etf_capital, open_positions, daily_pnl, weekly_pnl,
+         mode, source, free_balance_gbp, margin_used_gbp, metadata_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
+    metadata_json = json.dumps(metadata) if metadata else None
     with get_connection() as conn:
         cur = conn.execute(
             sql,
             (_now(), total_capital, crypto_capital, forex_capital,
-             etf_capital, open_positions, daily_pnl, weekly_pnl),
+             etf_capital, open_positions, daily_pnl, weekly_pnl,
+             mode, source, free_balance_gbp, margin_used_gbp, metadata_json),
         )
         return cur.lastrowid
 
@@ -338,6 +465,97 @@ def set_system_flag(key: str, value: str) -> None:
         conn.execute(sql, (key, value, _now()))
 
 
+def reset_runtime_state(
+    *,
+    total_capital: float,
+    mode: str = "paper",
+    source: str = "kraken_reset",
+    crypto_capital: Optional[float] = None,
+    forex_capital: float = 0.0,
+    etf_capital: float = 0.0,
+    free_balance_gbp: Optional[float] = None,
+    margin_used_gbp: float = 0.0,
+    note: str = "Runtime state reset",
+) -> dict:
+    """
+    Clear runtime trading state while preserving configuration and secrets.
+
+    This deletes trades, equity snapshots, logs, circuit breaker events, and
+    flags from the SQLite runtime DB, then creates one clean equity snapshot.
+    It does not touch config/secrets.yaml or any exchange-side account state.
+    """
+    init_db()
+    tables = [
+        "trades",
+        "equity_snapshots",
+        "system_logs",
+        "circuit_breaker_events",
+        "system_flags",
+    ]
+    now = _now()
+    total = float(total_capital)
+    crypto = float(total if crypto_capital is None else crypto_capital)
+    free = total if free_balance_gbp is None else float(free_balance_gbp)
+
+    with get_connection() as conn:
+        before = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in tables
+        }
+        for table in tables:
+            conn.execute(f"DELETE FROM {table}")
+        conn.execute(
+            "DELETE FROM sqlite_sequence WHERE name IN (?, ?, ?, ?)",
+            ("trades", "equity_snapshots", "system_logs", "circuit_breaker_events"),
+        )
+        conn.execute(
+            """
+            INSERT INTO equity_snapshots
+                (timestamp, total_capital, crypto_capital, forex_capital,
+                 etf_capital, open_positions, daily_pnl, weekly_pnl,
+                 mode, source, free_balance_gbp, margin_used_gbp, metadata_json)
+            VALUES (?, ?, ?, ?, ?, 0, 0.0, 0.0, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                total,
+                crypto,
+                float(forex_capital),
+                float(etf_capital),
+                mode,
+                source,
+                free,
+                float(margin_used_gbp),
+                json.dumps({"reset": True, "note": note}),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO system_flags (key, value, updated_at)
+            VALUES ('paused', 'false', ?)
+            """,
+            (now,),
+        )
+        conn.execute(
+            "INSERT INTO system_logs (timestamp, level, module, message) VALUES (?, ?, ?, ?)",
+            (now, "INFO", "database", note),
+        )
+        after = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in tables
+        }
+
+    return {
+        "before": before,
+        "after": after,
+        "total_capital": total,
+        "mode": mode,
+        "source": source,
+        "free_balance_gbp": free,
+        "open_positions": 0,
+    }
+
+
 def get_circuit_breaker_history(limit: int = 20) -> list[dict]:
     sql = "SELECT * FROM circuit_breaker_events ORDER BY timestamp DESC LIMIT ?"
     with get_connection() as conn:
@@ -373,6 +591,30 @@ def get_total_pnl() -> float:
         return conn.execute(sql).fetchone()[0]
 
 
+def get_total_fees() -> float:
+    sql = "SELECT COALESCE(SUM(total_fees_gbp), 0.0) FROM trades WHERE status != 'open'"
+    with get_connection() as conn:
+        return conn.execute(sql).fetchone()[0]
+
+
+def get_daily_fees(date_iso: str) -> float:
+    sql = """
+    SELECT COALESCE(SUM(total_fees_gbp), 0.0) FROM trades
+    WHERE timestamp_close LIKE ? AND status != 'open'
+    """
+    with get_connection() as conn:
+        return conn.execute(sql, (f"{date_iso}%",)).fetchone()[0]
+
+
+def get_weekly_fees(week_start_iso: str) -> float:
+    sql = """
+    SELECT COALESCE(SUM(total_fees_gbp), 0.0) FROM trades
+    WHERE timestamp_close >= ? AND status != 'open'
+    """
+    with get_connection() as conn:
+        return conn.execute(sql, (week_start_iso,)).fetchone()[0]
+
+
 def calculate_current_equity() -> float:
     """
     Calculate live equity: initial_capital + realized PnL from all closed trades.
@@ -381,7 +623,15 @@ def calculate_current_equity() -> float:
     risk manager, and circuit breakers instead of stale equity snapshots.
     """
     from config.loader import get_settings
-    initial = get_settings().get("initial_capital_gbp", 1000)
+    settings = get_settings()
+    mode = settings.get("mode", "paper")
+    latest_snapshot = get_latest_equity()
+    if mode != "paper" and latest_snapshot and latest_snapshot.get("source") in {"binance", "kraken"}:
+        total = latest_snapshot.get("total_capital")
+        if total is not None:
+            return float(total)
+
+    initial = settings.get("initial_capital_gbp", 1000)
     realized_pnl = get_total_pnl()
     return initial + realized_pnl
 

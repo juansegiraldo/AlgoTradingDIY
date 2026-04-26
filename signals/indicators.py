@@ -255,6 +255,49 @@ def check_trend(df: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Volatility context
+# ---------------------------------------------------------------------------
+
+
+def compute_atr(df: pd.DataFrame, period: int = None) -> pd.Series:
+    """Compute Average True Range series."""
+    cfg = _get_indicator_settings()
+    period = period or cfg.get("atr_period", 14)
+    return ta.volatility.AverageTrueRange(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=period,
+    ).average_true_range()
+
+
+def check_volatility(df: pd.DataFrame) -> dict:
+    """Return ATR-based volatility context for dynamic exits."""
+    cfg = _get_indicator_settings()
+    period = cfg.get("atr_period", 14)
+    if len(df) < period + 1:
+        return {
+            "atr": None,
+            "atr_pct": None,
+            "period": period,
+            "range_pct": None,
+        }
+
+    atr = compute_atr(df, period).iloc[-1]
+    close = df["close"].iloc[-1]
+    high = df["high"].iloc[-1]
+    low = df["low"].iloc[-1]
+    atr_pct = (atr / close * 100.0) if close > 0 else 0.0
+    range_pct = ((high - low) / close * 100.0) if close > 0 else 0.0
+    return {
+        "atr": round(float(atr), 8),
+        "atr_pct": round(float(atr_pct), 4),
+        "period": period,
+        "range_pct": round(float(range_pct), 4),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run all 4 indicators at once
 # ---------------------------------------------------------------------------
 
@@ -278,6 +321,7 @@ def analyze(df: pd.DataFrame) -> dict:
         "macd": check_macd(df),
         "volume": check_volume(df),
         "trend": check_trend(df),
+        "volatility": check_volatility(df),
     }
 
 

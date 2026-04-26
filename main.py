@@ -43,8 +43,9 @@ from notifications.report_generator import (
     send_daily_report,
     send_weekly_report,
     send_partial_report,
+    send_morning_report,
 )
-from execution.binance_executor import health_check as binance_health_check
+from execution.crypto_executor import get_exchange_name, health_check as crypto_health_check
 from execution.position_manager import check_open_positions
 
 logger = logging.getLogger(__name__)
@@ -78,13 +79,14 @@ def scheduled_scan():
 def scheduled_health_check():
     """Check exchange connectivity."""
     try:
-        hc = binance_health_check()
+        exchange = get_exchange_name()
+        hc = crypto_health_check()
         if hc["status"] != "ok":
-            logger.warning(f"Binance health check failed: {hc}")
+            logger.warning(f"{exchange.title()} health check failed: {hc}")
             try:
                 send_text_sync(
                     f"\u26a0 <b>Health Check FAILED</b>\n"
-                    f"Binance: {hc.get('error', 'unknown')}"
+                    f"{exchange.title()}: {hc.get('error', 'unknown')}"
                 )
             except Exception:
                 pass
@@ -100,6 +102,14 @@ def scheduled_partial_report():
         send_partial_report()
     except Exception as e:
         logger.error(f"Partial report error: {e}")
+
+
+def scheduled_morning_report():
+    """Send morning readiness and exchange balance snapshot."""
+    try:
+        send_morning_report()
+    except Exception as e:
+        logger.error(f"Morning report error: {e}")
 
 
 def scheduled_daily_report():
@@ -135,7 +145,8 @@ def print_banner(settings: dict):
     print(f"  Mode:       {mode}")
     print(f"  Capital:    GBP {capital:,}")
     print(f"  Scanner:    every {sched.get('scanner_interval_minutes', 5)} min")
-    print(f"  Markets:    Crypto (Binance)")
+    exchange = settings.get("markets", {}).get("crypto", {}).get("exchange", "kraken").title()
+    print(f"  Markets:    Crypto ({exchange})")
     print(f"  Pairs:      {settings['markets']['crypto']['pairs']}")
     print(f"  Timeframes: {settings['markets']['crypto']['timeframes']}")
     print(f"  Telegram:   @AlgoTradeJSG_bot")
@@ -233,7 +244,7 @@ async def main():
 
     morning_time = sched_cfg.get("morning_report_time", "08:00").split(":")
     scheduler.add_job(
-        scheduled_partial_report,
+        scheduled_morning_report,
         CronTrigger(hour=int(morning_time[0]), minute=int(morning_time[1]), timezone=london_tz),
         id="morning_report",
         name="Morning Report (08:00 London)",

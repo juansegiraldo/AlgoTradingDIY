@@ -9,9 +9,9 @@ Checks all open trades on every poll cycle and:
 
 PnL formula
 -----------
-USDT :  long  = (exit - entry) * size * leverage
-         short = (entry - exit) * size * leverage
-GBP  :  pnl_usdt / GBP_PER_USDT   (1 GBP ~= 1.27 USD)
+Quote: long  = (exit - entry) * size
+       short = (entry - exit) * size
+GBP  : quote PnL converted according to the active pair quote currency.
 
 pnl_percent is always calculated against the *notional* value at entry
 (entry_price * original_position_size).
@@ -31,6 +31,7 @@ from data.database import (
     count_open_trades,
     get_open_trades,
     get_trade,
+    add_trade_exit_fee,
     close_trade,
     get_connection,
     log_info,
@@ -38,8 +39,11 @@ from data.database import (
     log_error,
     save_equity_snapshot,
     update_tp1_state,
+    set_system_flag,
 )
-from execution.binance_executor import fetch_price, fetch_position_size, close_position
+from config.loader import get_settings
+from execution.crypto_executor import close_position, fetch_position_size, fetch_price, quote_to_gbp
+from execution.fees import estimate_fee_gbp, extract_order_fee_gbp
 from notifications.telegram_bot import send_text_sync, send_close_notification_sync
 
 logger = logging.getLogger(__name__)
@@ -47,9 +51,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-
-# GBP/USD conversion constant (1 GBP ≈ 1.27 USDT)
-_GBP_PER_USDT: float = 1.0 / 1.27
 
 # Trades that already had TP1 hit — avoids re-triggering a second partial close.
 _tp1_hit_trades: set[int] = set()
@@ -75,7 +76,7 @@ def _calc_pnl(
     leverage: float,
 ) -> tuple[float, float]:
     """
-    Return (pnl_usdt, pnl_percent).
+    Return (pnl_quote, pnl_percent).
 
     position_size is the actual quantity traded (e.g. 0.019 BTC).
     The position sizer already accounts for leverage when calculating
@@ -85,17 +86,44 @@ def _calc_pnl(
     pnl_percent is relative to the notional value at entry.
     """
     if direction == "long":
-        pnl_usdt = (exit_price - entry_price) * position_size
+        pnl_quote = (exit_price - entry_price) * position_size
     else:
-        pnl_usdt = (entry_price - exit_price) * position_size
+        pnl_quote = (entry_price - exit_price) * position_size
 
     notional = entry_price * position_size
-    pnl_pct = (pnl_usdt / notional * 100.0) if notional > 0 else 0.0
-    return pnl_usdt, pnl_pct
+    pnl_pct = (pnl_quote / notional * 100.0) if notional > 0 else 0.0
+    return pnl_quote, pnl_pct
 
 
-def _usdt_to_gbp(pnl_usdt: float) -> float:
-    return pnl_usdt * _GBP_PER_USDT
+def _quote_to_gbp(pair: str, pnl_quote: float) -> float:
+    return quote_to_gbp(pair, pnl_quote)
+
+
+def _entry_fee_gbp(trade: dict) -> float:
+    return float(trade.get("entry_fee_gbp") or 0.0)
+
+
+def _estimate_exit_fee_gbp(pair: str, exit_price: float, close_size: float) -> float:
+    return estimate_fee_gbp(pair, float(exit_price) * float(close_size))
+
+
+def _extract_exit_fee_gbp(
+    pair: str,
+    close_order: Optional[dict],
+    exit_price: float,
+    close_size: float,
+) -> dict:
+    return extract_order_fee_gbp(
+        pair,
+        close_order or {},
+        price=exit_price,
+        fallback_notional_quote=float(exit_price) * float(close_size),
+    )
+
+
+def _net_pnl_pct(net_pnl_gbp: float, pair: str, entry_price: float, size: float) -> float:
+    notional_gbp = _quote_to_gbp(pair, float(entry_price) * float(size))
+    return (net_pnl_gbp / notional_gbp * 100.0) if notional_gbp > 0 else 0.0
 
 
 def _update_trade_notes(trade_id: int, notes: str) -> None:
@@ -140,6 +168,28 @@ def _snapshot_equity_after_close() -> None:
         log_warning("position_manager", f"Could not save post-close equity snapshot: {exc}")
 
 
+def _auto_pause_live(reason: str, trade: Optional[dict] = None) -> None:
+    """Pause live trading after critical execution-management failures."""
+    settings = get_settings()
+    if settings.get("mode", "paper") == "paper":
+        return
+    if not settings.get("live_deployment", {}).get("auto_pause_on_live_failures", True):
+        return
+
+    set_system_flag("paused", "true")
+    pair = trade.get("pair") if trade else "N/A"
+    message = f"{reason} | pair={pair}"
+    log_error("position_manager", f"AUTO-PAUSE: {message}")
+    try:
+        send_text_sync(
+            f"\u26d4 <b>SISTEMA PAUSADO AUTOMATICAMENTE</b>\n\n"
+            f"{message}\n\n"
+            f"<i>Revisa cierres, ordenes abiertas y el exchange antes de reanudar.</i>"
+        )
+    except Exception:
+        pass
+
+
 def _get_effective_size(trade: dict) -> float:
     """
     Return the effective (remaining) position size for a trade.
@@ -160,7 +210,7 @@ def _get_effective_size(trade: dict) -> float:
 def _reconcile_exchange_positions(trades: list[dict]) -> list[dict]:
     """
     Check each open DB trade against the exchange. If a position no longer
-    exists on the exchange (e.g. Binance already filled the SL/TP order),
+    exists on the exchange (e.g. an exchange-side SL/TP order filled),
     close it in the DB so we don't try to manage a ghost position.
 
     Returns the list of trades that are still actually open.
@@ -192,13 +242,27 @@ def _reconcile_exchange_positions(trades: list[dict]) -> list[dict]:
             current_price = entry_price
 
         close_size = _get_effective_size(trade)
-        pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, current_price, close_size, leverage)
-        pnl_gbp = _usdt_to_gbp(pnl_usdt)
+        pnl_usdt, _gross_pnl_pct = _calc_pnl(direction, entry_price, current_price, close_size, leverage)
+        gross_pnl_gbp = _quote_to_gbp(pair, pnl_usdt)
+        partial_gross_pnl = float(trade.get("realized_partial_pnl_gbp") or 0.0)
+        entry_fee = _entry_fee_gbp(trade)
+        prior_exit_fees = float(trade.get("exit_fee_gbp") or 0.0)
+        exit_fee_gbp = _estimate_exit_fee_gbp(pair, current_price, close_size)
+        total_gross_pnl_gbp = partial_gross_pnl + gross_pnl_gbp
+        total_fees_gbp = entry_fee + prior_exit_fees + exit_fee_gbp
+        net_pnl_gbp = total_gross_pnl_gbp - total_fees_gbp
+        net_pnl_pct = _net_pnl_pct(
+            net_pnl_gbp,
+            pair,
+            entry_price,
+            float(trade.get("position_size") or close_size),
+        )
 
         log_warning(
             "position_manager",
             f"Reconciliation: trade #{trade_id} {pair} no longer on exchange. "
-            f"Closing in DB @ {current_price:,.4f} | PnL {pnl_gbp:+.2f} GBP",
+            f"Closing in DB @ {current_price:,.4f} | Gross {total_gross_pnl_gbp:+.2f} GBP "
+            f"| Fees {total_fees_gbp:.2f} GBP | Net {net_pnl_gbp:+.2f} GBP",
         )
 
         try:
@@ -206,19 +270,34 @@ def _reconcile_exchange_positions(trades: list[dict]) -> list[dict]:
                 trade_id=trade_id,
                 exit_price=current_price,
                 status="closed_exchange",
-                pnl_absolute=round(pnl_gbp, 4),
-                pnl_percent=round(pnl_pct, 4),
+                pnl_absolute=round(net_pnl_gbp, 4),
+                pnl_percent=round(net_pnl_pct, 4),
+                pnl_gross_gbp=round(gross_pnl_gbp, 4),
+                exit_fee_gbp=exit_fee_gbp,
+                fee_details={
+                    "entry_fee_gbp": entry_fee,
+                    "prior_exit_fees_gbp": prior_exit_fees,
+                    "exit_fee_gbp": exit_fee_gbp,
+                    "exit_fee_source": "estimated_reconcile",
+                },
             )
             _snapshot_equity_after_close()
             _tp1_hit_trades.discard(trade_id)
             _remaining_sizes.pop(trade_id, None)
 
             closed_trade = _build_closed_trade_dict(
-                trade, current_price, "closed_exchange", pnl_gbp, pnl_pct
+                trade,
+                current_price,
+                "closed_exchange",
+                net_pnl_gbp,
+                net_pnl_pct,
+                gross_pnl_gbp=total_gross_pnl_gbp,
+                exit_fee_gbp=exit_fee_gbp,
             )
             _notify_close(closed_trade)
         except Exception as exc:
             log_error("position_manager", f"Reconciliation DB close failed #{trade_id}: {exc}")
+            _auto_pause_live(f"Reconciliation DB close failed for trade #{trade_id}: {exc}", trade)
             still_open.append(trade)
 
     return still_open
@@ -352,35 +431,71 @@ def _handle_stop_loss(
     direction: str = trade["direction"]
     entry_price: float = float(trade["entry_price"])
 
-    pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
-    pnl_gbp = _usdt_to_gbp(pnl_usdt)
+    pnl_usdt, _gross_pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
+    closing_gross_pnl_gbp = _quote_to_gbp(pair, pnl_usdt)
+    partial_gross_pnl = float(trade.get("realized_partial_pnl_gbp") or 0.0)
+    entry_fee = _entry_fee_gbp(trade)
+    prior_exit_fees = float(trade.get("exit_fee_gbp") or 0.0)
+    close_order = None
+    exit_fee_info = {
+        "fee_gbp": _estimate_exit_fee_gbp(pair, exit_price, close_size),
+        "fee_source": "estimated",
+    }
 
     log_info(
         "position_manager",
         f"STOP-LOSS hit: trade #{trade_id} {pair} {direction.upper()} "
-        f"@ {exit_price:,.4f} | PnL {pnl_gbp:+.2f} GBP",
+        f"@ {exit_price:,.4f}",
     )
 
     try:
-        close_position(pair, direction, close_size)
+        close_order = close_position(pair, direction, close_size)
+        exit_fee_info = _extract_exit_fee_gbp(pair, close_order, exit_price, close_size)
     except Exception as exc:
         log_error(
             "position_manager",
             f"Broker close failed for SL trade #{trade_id}: {exc}",
         )
         logger.error("Broker close_position failed for %s #%d: %s", pair, trade_id, exc)
+        _auto_pause_live(f"Broker close failed for stop-loss trade #{trade_id}: {exc}", trade)
         # Fall through and still close in DB so the trade is not stuck.
+
+    exit_fee_gbp = float(exit_fee_info["fee_gbp"])
+    total_gross_pnl_gbp = partial_gross_pnl + closing_gross_pnl_gbp
+    total_fees_gbp = entry_fee + prior_exit_fees + exit_fee_gbp
+    net_pnl_gbp = total_gross_pnl_gbp - total_fees_gbp
+    net_pnl_pct = _net_pnl_pct(
+        net_pnl_gbp,
+        pair,
+        entry_price,
+        float(trade.get("position_size") or close_size),
+    )
+    log_info(
+        "position_manager",
+        f"STOP-LOSS net: trade #{trade_id} gross {total_gross_pnl_gbp:+.2f} GBP "
+        f"| fees {total_fees_gbp:.2f} GBP | net {net_pnl_gbp:+.2f} GBP",
+    )
 
     try:
         close_trade(
             trade_id=trade_id,
             exit_price=exit_price,
             status="closed_sl",
-            pnl_absolute=round(pnl_gbp, 4),
-            pnl_percent=round(pnl_pct, 4),
+            pnl_absolute=round(net_pnl_gbp, 4),
+            pnl_percent=round(net_pnl_pct, 4),
+            pnl_gross_gbp=round(closing_gross_pnl_gbp, 4),
+            exit_fee_gbp=exit_fee_gbp,
+            fee_details={
+                "entry_fee_gbp": entry_fee,
+                "prior_exit_fees_gbp": prior_exit_fees,
+                "exit_fee_gbp": exit_fee_gbp,
+                "exit_fee_source": exit_fee_info["fee_source"],
+                "close_order_id": (close_order or {}).get("id"),
+            },
         )
     except Exception as exc:
         log_error("position_manager", f"DB close failed for SL trade #{trade_id}: {exc}")
+        _auto_pause_live(f"DB close failed for stop-loss trade #{trade_id}: {exc}", trade)
         return
 
     _snapshot_equity_after_close()
@@ -390,7 +505,15 @@ def _handle_stop_loss(
     _remaining_sizes.pop(trade_id, None)
 
     # Notification
-    closed_trade = _build_closed_trade_dict(trade, exit_price, "closed_sl", pnl_gbp, pnl_pct)
+    closed_trade = _build_closed_trade_dict(
+        trade,
+        exit_price,
+        "closed_sl",
+        net_pnl_gbp,
+        net_pnl_pct,
+        gross_pnl_gbp=total_gross_pnl_gbp,
+        exit_fee_gbp=exit_fee_gbp,
+    )
     _notify_close(closed_trade)
 
 
@@ -409,14 +532,22 @@ def _handle_tp1(
     close_size = round(full_size * 0.5, 8)
     remaining_size = round(full_size - close_size, 8)
 
-    pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
-    pnl_gbp = _usdt_to_gbp(pnl_usdt)
+    pnl_usdt, _gross_pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
+    gross_pnl_gbp = _quote_to_gbp(pair, pnl_usdt)
+    entry_fee_alloc = _entry_fee_gbp(trade) * (close_size / full_size if full_size > 0 else 0.0)
+    close_order = None
+    exit_fee_info = {
+        "fee_gbp": _estimate_exit_fee_gbp(pair, exit_price, close_size),
+        "fee_source": "estimated",
+    }
+    net_pnl_gbp = gross_pnl_gbp - entry_fee_alloc - exit_fee_info["fee_gbp"]
+    net_pnl_pct = _net_pnl_pct(net_pnl_gbp, pair, entry_price, close_size)
 
     log_info(
         "position_manager",
         f"TP1 hit: trade #{trade_id} {pair} {direction.upper()} "
         f"@ {exit_price:,.4f} | Partial close {close_size} ({50}%) "
-        f"| Remaining {remaining_size} | Partial PnL {pnl_gbp:+.2f} GBP",
+        f"| Remaining {remaining_size}",
     )
 
     # Mark TP1 reached in memory and DB before broker call to prevent race conditions
@@ -429,19 +560,40 @@ def _handle_tp1(
         log_error("position_manager", f"Could not persist TP1 state for trade #{trade_id}: {exc}")
 
     try:
-        close_position(pair, direction, close_size)
+        close_order = close_position(pair, direction, close_size)
+        exit_fee_info = _extract_exit_fee_gbp(pair, close_order, exit_price, close_size)
+        net_pnl_gbp = gross_pnl_gbp - entry_fee_alloc - float(exit_fee_info["fee_gbp"])
+        net_pnl_pct = _net_pnl_pct(net_pnl_gbp, pair, entry_price, close_size)
     except Exception as exc:
         log_error(
             "position_manager",
             f"Broker partial close failed for TP1 trade #{trade_id}: {exc}",
         )
         logger.error("Broker partial close failed for %s #%d: %s", pair, trade_id, exc)
+        _auto_pause_live(f"Broker partial close failed for TP1 trade #{trade_id}: {exc}", trade)
+
+    exit_fee_gbp = float(exit_fee_info["fee_gbp"])
+    try:
+        add_trade_exit_fee(
+            trade_id,
+            exit_fee_gbp,
+            realized_pnl_gbp=round(gross_pnl_gbp, 4),
+            fee_details={
+                "tp1_entry_fee_alloc_gbp": round(entry_fee_alloc, 6),
+                "tp1_exit_fee_gbp": exit_fee_gbp,
+                "tp1_exit_fee_source": exit_fee_info["fee_source"],
+                "tp1_close_order_id": (close_order or {}).get("id"),
+            },
+        )
+    except Exception as exc:
+        log_error("position_manager", f"Could not persist TP1 fees for trade #{trade_id}: {exc}")
 
     # Update notes in DB to record the partial close
     existing_notes: str = trade.get("notes") or ""
     tp1_note = (
         f"[TP1] Partial close {close_size} @ {exit_price:,.4f} "
-        f"| PnL {pnl_gbp:+.2f} GBP | Remaining {remaining_size}"
+        f"| Gross {gross_pnl_gbp:+.2f} GBP | Fees {entry_fee_alloc + exit_fee_gbp:.2f} GBP "
+        f"| Net {net_pnl_gbp:+.2f} GBP | Remaining {remaining_size}"
     )
     new_notes = f"{existing_notes} | {tp1_note}" if existing_notes else tp1_note
 
@@ -452,7 +604,13 @@ def _handle_tp1(
 
     # Telegram notification (trade is still open for TP2)
     partial_dict = _build_closed_trade_dict(
-        trade, exit_price, "closed_tp1", pnl_gbp, pnl_pct
+        trade,
+        exit_price,
+        "closed_tp1",
+        net_pnl_gbp,
+        net_pnl_pct,
+        gross_pnl_gbp=gross_pnl_gbp,
+        exit_fee_gbp=exit_fee_gbp,
     )
     partial_dict["_partial"] = True
     partial_dict["remaining_size"] = remaining_size
@@ -464,7 +622,9 @@ def _handle_tp1(
             f"\U0001f4b0 Entrada: {entry_price:,.4f}\n"
             f"\U0001f3c1 Salida TP1: {exit_price:,.4f}\n"
             f"\U0001f4ca Cerrado: {close_size} | Restante: {remaining_size}\n"
-            f"{'PnL: +' if pnl_gbp >= 0 else 'PnL: '}{pnl_gbp:.2f} GBP\n\n"
+            f"Gross: {gross_pnl_gbp:+.2f} GBP\n"
+            f"Fees: -{entry_fee_alloc + exit_fee_gbp:.2f} GBP\n"
+            f"Net: {net_pnl_gbp:+.2f} GBP\n\n"
             f"<i>Posicion sigue abierta para TP2.</i>"
         )
     except Exception as exc:
@@ -483,40 +643,70 @@ def _handle_tp2(
     direction: str = trade["direction"]
     entry_price: float = float(trade["entry_price"])
 
-    pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
-    pnl_gbp = _usdt_to_gbp(pnl_usdt)
-
-    # If TP1 was already closed, add that partial PnL (stored in notes) to get
-    # total GBP PnL for reporting.  We keep DB pnl_absolute as the TP2 leg only
-    # since close_trade records the final close event.  The dashboard can sum up
-    # all closed legs by reading notes.  Keeping it simple here.
+    pnl_usdt, _gross_pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
+    closing_gross_pnl_gbp = _quote_to_gbp(pair, pnl_usdt)
+    partial_gross_pnl = float(trade.get("realized_partial_pnl_gbp") or 0.0)
+    prior_exit_fees = float(trade.get("exit_fee_gbp") or 0.0)
+    entry_fee = _entry_fee_gbp(trade)
+    close_order = None
+    exit_fee_info = {
+        "fee_gbp": _estimate_exit_fee_gbp(pair, exit_price, close_size),
+        "fee_source": "estimated",
+    }
 
     log_info(
         "position_manager",
         f"TP2 hit: trade #{trade_id} {pair} {direction.upper()} "
-        f"@ {exit_price:,.4f} | Close size {close_size} "
-        f"| Final leg PnL {pnl_gbp:+.2f} GBP",
+        f"@ {exit_price:,.4f} | Close size {close_size}",
     )
 
     try:
-        close_position(pair, direction, close_size)
+        close_order = close_position(pair, direction, close_size)
+        exit_fee_info = _extract_exit_fee_gbp(pair, close_order, exit_price, close_size)
     except Exception as exc:
         log_error(
             "position_manager",
             f"Broker close failed for TP2 trade #{trade_id}: {exc}",
         )
         logger.error("Broker TP2 close_position failed for %s #%d: %s", pair, trade_id, exc)
+        _auto_pause_live(f"Broker close failed for TP2 trade #{trade_id}: {exc}", trade)
+
+    exit_fee_gbp = float(exit_fee_info["fee_gbp"])
+    total_gross_pnl_gbp = partial_gross_pnl + closing_gross_pnl_gbp
+    total_fees_gbp = entry_fee + prior_exit_fees + exit_fee_gbp
+    net_pnl_gbp = total_gross_pnl_gbp - total_fees_gbp
+    net_pnl_pct = _net_pnl_pct(
+        net_pnl_gbp,
+        pair,
+        entry_price,
+        float(trade.get("position_size") or close_size),
+    )
+    log_info(
+        "position_manager",
+        f"TP2 net: trade #{trade_id} gross {total_gross_pnl_gbp:+.2f} GBP "
+        f"| fees {total_fees_gbp:.2f} GBP | net {net_pnl_gbp:+.2f} GBP",
+    )
 
     try:
         close_trade(
             trade_id=trade_id,
             exit_price=exit_price,
             status="closed_tp2",
-            pnl_absolute=round(pnl_gbp, 4),
-            pnl_percent=round(pnl_pct, 4),
+            pnl_absolute=round(net_pnl_gbp, 4),
+            pnl_percent=round(net_pnl_pct, 4),
+            pnl_gross_gbp=round(closing_gross_pnl_gbp, 4),
+            exit_fee_gbp=exit_fee_gbp,
+            fee_details={
+                "entry_fee_gbp": entry_fee,
+                "prior_exit_fees_gbp": prior_exit_fees,
+                "exit_fee_gbp": exit_fee_gbp,
+                "exit_fee_source": exit_fee_info["fee_source"],
+                "close_order_id": (close_order or {}).get("id"),
+            },
         )
     except Exception as exc:
         log_error("position_manager", f"DB close failed for TP2 trade #{trade_id}: {exc}")
+        _auto_pause_live(f"DB close failed for TP2 trade #{trade_id}: {exc}", trade)
         return
 
     _snapshot_equity_after_close()
@@ -525,7 +715,15 @@ def _handle_tp2(
     _tp1_hit_trades.discard(trade_id)
     _remaining_sizes.pop(trade_id, None)
 
-    closed_trade = _build_closed_trade_dict(trade, exit_price, "closed_tp2", pnl_gbp, pnl_pct)
+    closed_trade = _build_closed_trade_dict(
+        trade,
+        exit_price,
+        "closed_tp2",
+        net_pnl_gbp,
+        net_pnl_pct,
+        gross_pnl_gbp=total_gross_pnl_gbp,
+        exit_fee_gbp=exit_fee_gbp,
+    )
     _notify_close(closed_trade)
 
 
@@ -570,20 +768,41 @@ def close_trade_manual(trade_id: int) -> dict:
         log_error("position_manager", f"Manual close #{trade_id}: {msg}")
         return {"trade_id": trade_id, "success": False, "error": msg}
 
-    pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
-    pnl_gbp = _usdt_to_gbp(pnl_usdt)
+    pnl_usdt, _gross_pnl_pct = _calc_pnl(direction, entry_price, exit_price, close_size, leverage)
+    closing_gross_pnl_gbp = _quote_to_gbp(pair, pnl_usdt)
+    partial_gross_pnl = float(trade.get("realized_partial_pnl_gbp") or 0.0)
+    prior_exit_fees = float(trade.get("exit_fee_gbp") or 0.0)
+    entry_fee = _entry_fee_gbp(trade)
+    close_order = None
+    exit_fee_info = {
+        "fee_gbp": _estimate_exit_fee_gbp(pair, exit_price, close_size),
+        "fee_source": "estimated",
+    }
 
     # ------------------------------------------------------------------
     # Close on broker
     # ------------------------------------------------------------------
     try:
-        close_position(pair, direction, close_size)
+        close_order = close_position(pair, direction, close_size)
+        exit_fee_info = _extract_exit_fee_gbp(pair, close_order, exit_price, close_size)
     except Exception as exc:
         log_error(
             "position_manager",
             f"Broker close failed for manual trade #{trade_id}: {exc}",
         )
+        _auto_pause_live(f"Broker close failed for manual trade #{trade_id}: {exc}", trade)
         # Still attempt DB close so the position is not stuck.
+
+    exit_fee_gbp = float(exit_fee_info["fee_gbp"])
+    total_gross_pnl_gbp = partial_gross_pnl + closing_gross_pnl_gbp
+    total_fees_gbp = entry_fee + prior_exit_fees + exit_fee_gbp
+    net_pnl_gbp = total_gross_pnl_gbp - total_fees_gbp
+    net_pnl_pct = _net_pnl_pct(
+        net_pnl_gbp,
+        pair,
+        entry_price,
+        float(trade.get("position_size") or close_size),
+    )
 
     # ------------------------------------------------------------------
     # Close in DB
@@ -593,12 +812,22 @@ def close_trade_manual(trade_id: int) -> dict:
             trade_id=trade_id,
             exit_price=exit_price,
             status="closed_manual",
-            pnl_absolute=round(pnl_gbp, 4),
-            pnl_percent=round(pnl_pct, 4),
+            pnl_absolute=round(net_pnl_gbp, 4),
+            pnl_percent=round(net_pnl_pct, 4),
+            pnl_gross_gbp=round(closing_gross_pnl_gbp, 4),
+            exit_fee_gbp=exit_fee_gbp,
+            fee_details={
+                "entry_fee_gbp": entry_fee,
+                "prior_exit_fees_gbp": prior_exit_fees,
+                "exit_fee_gbp": exit_fee_gbp,
+                "exit_fee_source": exit_fee_info["fee_source"],
+                "close_order_id": (close_order or {}).get("id"),
+            },
         )
     except Exception as exc:
         msg = f"DB close failed for manual trade #{trade_id}: {exc}"
         log_error("position_manager", msg)
+        _auto_pause_live(msg, trade)
         return {"trade_id": trade_id, "success": False, "error": msg}
 
     _snapshot_equity_after_close()
@@ -610,7 +839,8 @@ def close_trade_manual(trade_id: int) -> dict:
     log_info(
         "position_manager",
         f"Manual close: trade #{trade_id} {pair} {direction.upper()} "
-        f"@ {exit_price:,.4f} | PnL {pnl_gbp:+.2f} GBP",
+        f"@ {exit_price:,.4f} | Gross {total_gross_pnl_gbp:+.2f} GBP "
+        f"| Fees {total_fees_gbp:.2f} GBP | Net {net_pnl_gbp:+.2f} GBP",
     )
 
     result: dict = {
@@ -621,15 +851,28 @@ def close_trade_manual(trade_id: int) -> dict:
         "exit_price": exit_price,
         "position_size": close_size,
         "leverage": leverage,
+        "pnl_quote": round(pnl_usdt, 4),
         "pnl_usdt": round(pnl_usdt, 4),
-        "pnl_gbp": round(pnl_gbp, 4),
-        "pnl_pct": round(pnl_pct, 4),
+        "pnl_gross_gbp": round(total_gross_pnl_gbp, 4),
+        "entry_fee_gbp": round(entry_fee, 6),
+        "exit_fee_gbp": round(prior_exit_fees + exit_fee_gbp, 6),
+        "total_fees_gbp": round(total_fees_gbp, 6),
+        "pnl_gbp": round(net_pnl_gbp, 4),
+        "pnl_pct": round(net_pnl_pct, 4),
         "status": "closed_manual",
         "success": True,
     }
 
     # Notification
-    closed_trade = _build_closed_trade_dict(trade, exit_price, "closed_manual", pnl_gbp, pnl_pct)
+    closed_trade = _build_closed_trade_dict(
+        trade,
+        exit_price,
+        "closed_manual",
+        net_pnl_gbp,
+        net_pnl_pct,
+        gross_pnl_gbp=total_gross_pnl_gbp,
+        exit_fee_gbp=exit_fee_gbp,
+    )
     _notify_close(closed_trade)
 
     return result
@@ -684,7 +927,7 @@ def get_unrealized_pnl(trade: dict) -> dict:
     -------
     dict with keys:
         current_price       : float
-        unrealized_pnl_usdt : float
+        unrealized_pnl_quote: float
         unrealized_pnl_gbp  : float
         unrealized_pnl_pct  : float  (% of notional)
     """
@@ -703,14 +946,33 @@ def get_unrealized_pnl(trade: dict) -> dict:
         )
         raise
 
-    pnl_usdt, pnl_pct = _calc_pnl(direction, entry_price, current_price, size, leverage)
-    pnl_gbp = _usdt_to_gbp(pnl_usdt)
+    pnl_usdt, gross_pnl_pct = _calc_pnl(direction, entry_price, current_price, size, leverage)
+    gross_pnl_gbp = _quote_to_gbp(pair, pnl_usdt)
+    partial_gross_pnl = float(trade.get("realized_partial_pnl_gbp") or 0.0)
+    entry_fee = _entry_fee_gbp(trade)
+    exit_fees_paid = float(trade.get("exit_fee_gbp") or 0.0)
+    estimated_exit_fee = _estimate_exit_fee_gbp(pair, current_price, size)
+    total_estimated_fees = entry_fee + exit_fees_paid + estimated_exit_fee
+    net_pnl_gbp = partial_gross_pnl + gross_pnl_gbp - total_estimated_fees
+    net_pnl_pct = _net_pnl_pct(
+        net_pnl_gbp,
+        pair,
+        entry_price,
+        float(trade.get("position_size") or size),
+    )
 
     return {
         "current_price": current_price,
+        "unrealized_pnl_quote": round(pnl_usdt, 4),
         "unrealized_pnl_usdt": round(pnl_usdt, 4),
-        "unrealized_pnl_gbp": round(pnl_gbp, 4),
-        "unrealized_pnl_pct": round(pnl_pct, 4),
+        "unrealized_pnl_gross_gbp": round(partial_gross_pnl + gross_pnl_gbp, 4),
+        "entry_fee_gbp": round(entry_fee, 6),
+        "exit_fees_paid_gbp": round(exit_fees_paid, 6),
+        "estimated_exit_fee_gbp": round(estimated_exit_fee, 6),
+        "estimated_total_fees_gbp": round(total_estimated_fees, 6),
+        "unrealized_pnl_gbp": round(net_pnl_gbp, 4),
+        "unrealized_pnl_pct": round(net_pnl_pct, 4),
+        "unrealized_pnl_gross_pct": round(gross_pnl_pct, 4),
     }
 
 
@@ -725,8 +987,14 @@ def _build_closed_trade_dict(
     status: str,
     pnl_gbp: float,
     pnl_pct: float,
+    *,
+    gross_pnl_gbp: Optional[float] = None,
+    exit_fee_gbp: float = 0.0,
 ) -> dict:
     """Build a minimal trade dict compatible with ``format_close_notification``."""
+    entry_fee = _entry_fee_gbp(trade)
+    prior_exit_fees = float(trade.get("exit_fee_gbp") or 0.0)
+    total_fees = entry_fee + prior_exit_fees + float(exit_fee_gbp or 0.0)
     return {
         "id": trade["id"],
         "pair": trade["pair"],
@@ -736,6 +1004,13 @@ def _build_closed_trade_dict(
         "position_size": trade["position_size"],
         "leverage": trade.get("leverage", 1),
         "status": status,
+        "pnl_gross_gbp": round(
+            float(gross_pnl_gbp if gross_pnl_gbp is not None else pnl_gbp),
+            4,
+        ),
+        "entry_fee_gbp": round(entry_fee, 6),
+        "exit_fee_gbp": round(prior_exit_fees + float(exit_fee_gbp or 0.0), 6),
+        "total_fees_gbp": round(total_fees, 6),
         "pnl_absolute": round(pnl_gbp, 4),
         "pnl_percent": round(pnl_pct, 4),
     }
@@ -768,11 +1043,12 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Seed a test trade
-    from execution.binance_executor import fetch_price as _fp
-    price = _fp("BTC/USDT")
+    from execution.crypto_executor import fetch_price as _fp
+    pair = get_settings().get("markets", {}).get("crypto", {}).get("pairs", ["BTC/GBP"])[0]
+    price = _fp(pair)
     tid = _open_trade(
         market="crypto",
-        pair="BTC/USDT",
+        pair=pair,
         direction="long",
         entry_price=price,
         stop_loss=round(price * 0.98, 2),

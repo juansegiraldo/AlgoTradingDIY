@@ -21,8 +21,17 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.loader import get_secrets, get_settings
-from data.database import log_info, log_error, log_warning, get_open_trades, get_total_pnl
+from config.loader import get_gbp_usd_rate, get_live_stage_profile, get_secrets, get_settings
+from data.database import (
+    count_open_trades,
+    get_open_trades,
+    get_total_pnl,
+    log_error,
+    log_info,
+    log_warning,
+    save_equity_snapshot,
+    set_system_flag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +40,25 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _exchange: Optional[ccxt.binance] = None
+_markets_cache: Optional[dict] = None
 
 
 def _is_paper_mode() -> bool:
     mode = get_settings().get("mode", "paper")
     use_testnet = get_settings()["markets"]["crypto"].get("use_testnet", True)
     return mode == "paper" or use_testnet
+
+
+def _is_live_mode() -> bool:
+    return not _is_paper_mode()
+
+
+def _gbp_to_usdt(amount_gbp: float) -> float:
+    return float(amount_gbp) * get_gbp_usd_rate()
+
+
+def _usdt_to_gbp(amount_usdt: float) -> float:
+    return float(amount_usdt) / get_gbp_usd_rate()
 
 
 def get_exchange() -> ccxt.binance:
@@ -74,10 +96,28 @@ def get_exchange() -> ccxt.binance:
     return _exchange
 
 
+def get_markets(force_reload: bool = False) -> dict:
+    """Load and cache exchange markets for precision/limit validation."""
+    global _markets_cache
+    if _markets_cache is not None and not force_reload:
+        return _markets_cache
+    exchange = get_exchange()
+    _markets_cache = exchange.load_markets()
+    return _markets_cache
+
+
+def get_market(pair: str) -> dict:
+    markets = get_markets()
+    if pair not in markets:
+        raise ValueError(f"Symbol {pair} is not available on Binance")
+    return markets[pair]
+
+
 def reset_connection() -> None:
     """Force reconnection on next call."""
-    global _exchange
+    global _exchange, _markets_cache
     _exchange = None
+    _markets_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +149,215 @@ def fetch_order_book(pair: str, limit: int = 10) -> dict:
     return exchange.fetch_order_book(pair, limit=limit)
 
 
+def _normalize_amount(pair: str, amount: float) -> float:
+    exchange = get_exchange()
+    normalized = float(exchange.amount_to_precision(pair, amount))
+    return normalized
+
+
+def _normalize_price(pair: str, price: Optional[float]) -> Optional[float]:
+    if price is None:
+        return None
+    exchange = get_exchange()
+    normalized = float(exchange.price_to_precision(pair, price))
+    return normalized
+
+
+def _min_notional(market: dict) -> float:
+    limits = market.get("limits", {})
+    cost_min = ((limits.get("cost") or {}).get("min"))
+    if cost_min is not None:
+        return float(cost_min)
+    info = market.get("info", {}) or {}
+    for filt in info.get("filters", []):
+        if filt.get("filterType") == "MIN_NOTIONAL":
+            try:
+                return float(filt.get("notional") or filt.get("minNotional") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _max_leverage_for_market(market: dict, pair: str) -> Optional[float]:
+    max_from_limits = ((market.get("limits", {}).get("leverage") or {}).get("max"))
+    if max_from_limits is not None:
+        return float(max_from_limits)
+    info = market.get("info", {}) or {}
+    try:
+        if "maxLeverage" in info:
+            return float(info["maxLeverage"])
+    except (TypeError, ValueError):
+        return None
+    return float(get_live_stage_profile().get("leverage_max")) if _is_live_mode() else None
+
+
+def fetch_account_snapshot() -> dict:
+    """Fetch current account balance/margin and convert to GBP for reporting."""
+    balance = fetch_usdt_balance()
+    total_usdt = float(balance.get("total", 0) or 0)
+    free_usdt = float(balance.get("free", 0) or 0)
+    used_usdt = float(balance.get("used", 0) or 0)
+    settings = get_settings()
+    return {
+        "exchange": "binance",
+        "mode": "paper" if _is_paper_mode() else settings.get("mode", "paper"),
+        "source": "internal" if _is_paper_mode() else "binance",
+        "total_usdt": round(total_usdt, 4),
+        "free_usdt": round(free_usdt, 4),
+        "used_usdt": round(used_usdt, 4),
+        "total_gbp": round(_usdt_to_gbp(total_usdt), 2),
+        "free_gbp": round(_usdt_to_gbp(free_usdt), 2),
+        "used_gbp": round(_usdt_to_gbp(used_usdt), 2),
+        "live_stage": settings.get("live_stage", "stage_10"),
+    }
+
+
+def save_account_snapshot() -> dict:
+    """Persist the current account snapshot to equity_snapshots."""
+    snapshot = fetch_account_snapshot()
+    save_equity_snapshot(
+        total_capital=snapshot["total_gbp"],
+        crypto_capital=snapshot["total_gbp"],
+        open_positions=count_open_trades(),
+        mode=str(snapshot["mode"]),
+        source=str(snapshot["source"]),
+        free_balance_gbp=snapshot["free_gbp"],
+        margin_used_gbp=snapshot["used_gbp"],
+        metadata={
+            "exchange": snapshot["exchange"],
+            "total_usdt": snapshot["total_usdt"],
+            "free_usdt": snapshot["free_usdt"],
+            "used_usdt": snapshot["used_usdt"],
+            "live_stage": snapshot["live_stage"],
+        },
+    )
+    return snapshot
+
+
+def live_readiness_check() -> dict:
+    """Check whether the system is ready to place a real Binance order."""
+    settings = get_settings()
+    mode = settings.get("mode", "paper")
+    if _is_paper_mode():
+        return {"ready": True, "mode": "paper", "checks": {"mode": "paper/testnet"}}
+
+    if mode != "semi_auto":
+        return {
+            "ready": False,
+            "mode": mode,
+            "error": "Live trading only allowed in semi_auto mode",
+            "checks": {"mode": mode},
+        }
+
+    try:
+        exchange = get_exchange()
+        server_time = exchange.fetch_time()
+        snapshot = fetch_account_snapshot()
+    except Exception as exc:
+        return {"ready": False, "mode": mode, "error": str(exc), "checks": {"exchange": "unreachable"}}
+
+    free_gbp = snapshot["free_gbp"]
+    return {
+        "ready": free_gbp > 0,
+        "mode": mode,
+        "checks": {
+            "exchange": "ok",
+            "server_time": server_time,
+            "free_gbp": free_gbp,
+            "live_stage": settings.get("live_stage", "stage_10"),
+        },
+        "snapshot": snapshot,
+        "error": None if free_gbp > 0 else "No free balance available on Binance",
+    }
+
+
+def validate_live_order(
+    pair: str,
+    amount: float,
+    leverage: int,
+    stop_loss_price: float,
+    take_profit_1_price: Optional[float] = None,
+    take_profit_2_price: Optional[float] = None,
+) -> dict:
+    """Validate a live order against exchange limits and current stage profile."""
+    readiness = live_readiness_check()
+    if not readiness["ready"]:
+        return {"approved": False, "reason": readiness.get("error", "Live readiness check failed")}
+
+    market = get_market(pair)
+    normalized_amount = _normalize_amount(pair, amount)
+    if normalized_amount <= 0:
+        min_qty = ((market.get("limits", {}).get("amount") or {}).get("min")) or 0
+        return {
+            "approved": False,
+            "reason": (
+                f"Normalized amount for {pair} is 0; requested size is below "
+                f"exchange precision/minQty {float(min_qty):.8f}"
+            ),
+        }
+
+    entry_price = fetch_price(pair)
+    normalized_sl = _normalize_price(pair, stop_loss_price)
+    normalized_tp1 = _normalize_price(pair, take_profit_1_price)
+    normalized_tp2 = _normalize_price(pair, take_profit_2_price)
+
+    min_qty = ((market.get("limits", {}).get("amount") or {}).get("min")) or 0
+    if min_qty and normalized_amount < float(min_qty):
+        return {
+            "approved": False,
+            "reason": f"Amount {normalized_amount} below minQty {float(min_qty)} for {pair}",
+        }
+
+    notional = normalized_amount * entry_price
+    min_notional = _min_notional(market)
+    if min_notional and notional < min_notional:
+        return {
+            "approved": False,
+            "reason": f"Notional {notional:.4f} below minNotional {min_notional:.4f} for {pair}",
+        }
+
+    market_max_leverage = _max_leverage_for_market(market, pair)
+    if market_max_leverage is not None and float(leverage) > market_max_leverage:
+        return {
+            "approved": False,
+            "reason": f"Leverage {leverage}x exceeds Binance max {market_max_leverage}x for {pair}",
+        }
+
+    stage_profile = get_live_stage_profile()
+    stage_leverage_max = stage_profile.get("leverage_max")
+    if stage_leverage_max is not None and float(leverage) > float(stage_leverage_max):
+        return {
+            "approved": False,
+            "reason": (
+                f"Leverage {leverage}x exceeds live stage max {stage_leverage_max}x "
+                f"for {get_settings().get('live_stage', 'stage_10')}"
+            ),
+        }
+
+    margin_required_usdt = notional / max(float(leverage), 1.0)
+    free_usdt = float(readiness["snapshot"]["free_usdt"])
+    if margin_required_usdt > free_usdt:
+        return {
+            "approved": False,
+            "reason": (
+                f"Insufficient free balance: need {margin_required_usdt:.4f} USDT, "
+                f"have {free_usdt:.4f} USDT"
+            ),
+        }
+
+    return {
+        "approved": True,
+        "entry_price": entry_price,
+        "normalized_amount": normalized_amount,
+        "normalized_stop_loss": normalized_sl,
+        "normalized_take_profit_1": normalized_tp1,
+        "normalized_take_profit_2": normalized_tp2,
+        "margin_required_usdt": round(margin_required_usdt, 4),
+        "notional_usdt": round(notional, 4),
+        "snapshot": readiness["snapshot"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Paper trading engine
 # ---------------------------------------------------------------------------
@@ -125,8 +374,7 @@ def _init_paper():
         return
     capital = get_settings().get("initial_capital_gbp", 1000)
     crypto_pct = get_settings()["markets"]["crypto"].get("capital_allocation_pct", 50)
-    # Approximate GBP to USDT (rough 1:1.27 rate)
-    usdt_capital = capital * (crypto_pct / 100.0) * 1.27
+    usdt_capital = _gbp_to_usdt(capital * (crypto_pct / 100.0))
     _paper_balance = {
         "USDT": {"free": usdt_capital, "used": 0, "total": usdt_capital}
     }
@@ -263,8 +511,7 @@ def _paper_balance_from_db() -> dict:
     """Calculate paper balance from DB (source of truth, survives restarts)."""
     capital_gbp = get_settings().get("initial_capital_gbp", 1000)
     crypto_pct = get_settings()["markets"]["crypto"].get("capital_allocation_pct", 50)
-    GBP_TO_USDT = 1.27
-    usdt_capital = capital_gbp * (crypto_pct / 100.0) * GBP_TO_USDT
+    usdt_capital = _gbp_to_usdt(capital_gbp * (crypto_pct / 100.0))
 
     margin_used = 0.0
     realized_pnl_usdt = 0.0
@@ -274,7 +521,7 @@ def _paper_balance_from_db() -> dict:
             size = float(t["position_size"])
             leverage = float(t.get("leverage") or 1)
             margin_used += size * entry / leverage
-        realized_pnl_usdt = get_total_pnl() * GBP_TO_USDT
+        realized_pnl_usdt = _gbp_to_usdt(get_total_pnl())
     except Exception:
         pass
 
@@ -447,6 +694,24 @@ def execute_trade(
     mode = "PAPER" if _is_paper_mode() else "LIVE"
 
     try:
+        if _is_live_mode():
+            validation = validate_live_order(
+                pair=pair,
+                amount=amount,
+                leverage=leverage,
+                stop_loss_price=stop_loss_price,
+                take_profit_1_price=take_profit_1_price,
+                take_profit_2_price=take_profit_2_price,
+            )
+            if not validation.get("approved"):
+                reason = validation.get("reason", "Live order validation failed")
+                log_error("binance", f"Live order rejected for {pair}: {reason}")
+                return {"success": False, "error": reason}
+            amount = float(validation["normalized_amount"])
+            stop_loss_price = float(validation["normalized_stop_loss"])
+            take_profit_1_price = validation.get("normalized_take_profit_1")
+            take_profit_2_price = validation.get("normalized_take_profit_2")
+
         # 1. Set leverage
         set_leverage(pair, leverage)
 
@@ -610,6 +875,7 @@ def health_check() -> dict:
             "mode": "paper" if paper else "live",
             "usdt_balance": balance,
             "server_time": server_time,
+            "readiness": live_readiness_check(),
         }
     except Exception as e:
         log_error("binance", f"Health check failed: {e}")

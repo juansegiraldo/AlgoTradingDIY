@@ -25,12 +25,13 @@ def render():
     wins = [t for t in closed if (t.get("pnl_absolute") or 0) > 0]
     losses = [t for t in closed if (t.get("pnl_absolute") or 0) < 0]
     total_pnl = sum(t.get("pnl_absolute", 0) or 0 for t in closed)
+    total_fees = sum(t.get("total_fees_gbp", 0) or 0 for t in closed)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total trades", len(closed))
     col2.metric("Ganados", len(wins))
     col3.metric("Perdidos", len(losses))
-    col4.metric("PnL neto", f"GBP {total_pnl:+,.2f}")
+    col4.metric("PnL neto", f"GBP {total_pnl:+,.2f}", delta=f"Fees -GBP {total_fees:,.2f}")
 
     # PnL per trade chart
     st.subheader("\U0001f4ca PnL por trade")
@@ -86,7 +87,9 @@ def render():
             "Dir": t["direction"].upper(),
             "Entrada": t["entry_price"],
             "Salida": t.get("exit_price"),
-            "PnL": f"GBP {(t.get('pnl_absolute') or 0):+.2f}",
+            "Gross": f"GBP {(t.get('pnl_gross_gbp') or t.get('pnl_absolute') or 0):+.2f}",
+            "Fees": f"GBP -{(t.get('total_fees_gbp') or 0):.2f}",
+            "Net": f"GBP {(t.get('pnl_absolute') or 0):+.2f}",
             "PnL%": f"{(t.get('pnl_percent') or 0):+.1f}%",
             "Status": t["status"],
             "Modo": t.get("mode", "paper"),

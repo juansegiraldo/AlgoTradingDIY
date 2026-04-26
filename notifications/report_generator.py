@@ -12,9 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.loader import get_settings
 from data.database import (
     get_all_trades,
+    get_daily_fees,
     get_daily_pnl,
     get_open_trades,
+    get_total_fees,
     get_total_pnl,
+    get_weekly_fees,
     get_weekly_pnl,
     get_win_rate,
     get_profit_factor,
@@ -33,7 +36,9 @@ def generate_daily_report() -> str:
     mode = get_settings().get("mode", "paper").upper()
 
     daily_pnl = get_daily_pnl(today)
+    daily_fees = get_daily_fees(today)
     realized_total = get_total_pnl()
+    total_fees = get_total_fees()
     win_rate = get_win_rate()
     pf = get_profit_factor()
     risk = get_risk_status()
@@ -75,8 +80,10 @@ def generate_daily_report() -> str:
         f"\U0001f3f7 Modo: {mode}\n"
         f"\n"
         f"{pnl_emoji} <b>PnL del dia:</b> GBP {daily_total:+,.2f}\n"
+        f"\U0001f9fe <b>Fees del dia:</b> GBP -{daily_fees:,.2f}\n"
         f"{unrealized_line}"
         f"\U0001f4b0 <b>PnL total:</b> GBP {total_pnl:+,.2f}\n"
+        f"\U0001f9fe <b>Fees total:</b> GBP -{total_fees:,.2f}\n"
         f"\U0001f4b0 <b>Capital:</b> GBP {risk['capital_current']:,.2f}\n"
         f"\n"
         f"\U0001f4c8 <b>Metricas:</b>\n"
@@ -105,7 +112,9 @@ def generate_weekly_report() -> str:
     mode = get_settings().get("mode", "paper").upper()
 
     weekly_pnl = get_weekly_pnl(week_start)
+    weekly_fees = get_weekly_fees(week_start)
     total_pnl = get_total_pnl()
+    total_fees = get_total_fees()
     win_rate = get_win_rate()
     pf = get_profit_factor()
     risk = get_risk_status()
@@ -130,8 +139,10 @@ def generate_weekly_report() -> str:
         f"\U0001f3f7 Modo: {mode}\n"
         f"\n"
         f"\U0001f4b0 <b>Resumen financiero:</b>\n"
-        f"  PnL semanal: GBP {weekly_pnl:+,.2f}\n"
-        f"  PnL total: GBP {total_pnl:+,.2f}\n"
+        f"  PnL semanal neto: GBP {weekly_pnl:+,.2f}\n"
+        f"  Fees semana: GBP -{weekly_fees:,.2f}\n"
+        f"  PnL total neto: GBP {total_pnl:+,.2f}\n"
+        f"  Fees total: GBP -{total_fees:,.2f}\n"
         f"  Capital: GBP {current:,.2f}\n"
         f"  Retorno total: {total_return:+.1f}%\n"
         f"\n"
@@ -169,6 +180,7 @@ def generate_partial_report() -> str:
     now_london = now.astimezone(london_tz)
     today = now.strftime("%Y-%m-%d")
     daily_pnl = get_daily_pnl(today)
+    daily_fees = get_daily_fees(today)
     open_count = count_open_trades()
     realized_pnl = get_total_pnl()
 
@@ -198,6 +210,8 @@ def generate_partial_report() -> str:
     if daily_pnl != 0:
         parts.append(f"Cerrado hoy: GBP {daily_pnl:+,.2f}")
     parts.append(f"PnL hoy: GBP {daily_total:+,.2f}")
+    if daily_fees:
+        parts.append(f"Fees hoy: GBP -{daily_fees:,.2f}")
     parts.append(f"Total: GBP {total_pnl:+,.2f}")
     parts.append(f"Abiertas: {open_count}")
     text += " | ".join(parts)
@@ -213,7 +227,12 @@ def generate_readiness_report() -> str:
     risk = get_risk_status()
 
     try:
-        from execution.binance_executor import live_readiness_check, fetch_positions, fetch_open_orders
+        from execution.crypto_executor import (
+            fetch_open_orders,
+            fetch_positions,
+            get_exchange_name,
+            live_readiness_check,
+        )
         readiness = live_readiness_check()
         snapshot = readiness.get("snapshot", {})
         positions = fetch_positions()
@@ -222,6 +241,7 @@ def generate_readiness_report() -> str:
         status = "LISTO" if ready else "BLOQUEADO"
         free_gbp = snapshot.get("free_gbp", 0.0)
         total_gbp = snapshot.get("total_gbp", 0.0)
+        exchange = snapshot.get("exchange") or get_exchange_name()
     except Exception as exc:
         ready = False
         status = "ERROR"
@@ -229,42 +249,55 @@ def generate_readiness_report() -> str:
         orders = []
         free_gbp = 0.0
         total_gbp = 0.0
+        exchange = get_settings().get("markets", {}).get("crypto", {}).get("exchange", "exchange")
         readiness = {"error": str(exc)}
 
     error_line = ""
     if readiness.get("error"):
         error_line = f"\n\u26a0 Error: {readiness['error']}"
+    try:
+        from execution.fees import estimate_round_trip_fee_gbp, get_taker_fee_pct
+        fee_notional = min(float(free_gbp or 0.0), 10.0)
+        fee_line = (
+            f"\nFee est. ida/vuelta GBP {fee_notional:,.2f}: "
+            f"GBP {estimate_round_trip_fee_gbp('BTC/GBP', fee_notional):,.2f} "
+            f"({get_taker_fee_pct():.2f}% taker/lado)"
+        )
+    except Exception:
+        fee_line = ""
 
     return (
         f"\U0001f6e1 <b>READY CHECK</b>\n"
         f"Modo: {mode}\n"
         f"Stage: {stage}\n"
         f"Estado: <b>{status}</b>\n"
-        f"Saldo Binance: GBP {total_gbp:,.2f}\n"
+        f"Saldo {str(exchange).title()}: GBP {total_gbp:,.2f}\n"
         f"Disponible: GBP {free_gbp:,.2f}\n"
         f"Posiciones abiertas: {len(positions)}\n"
         f"Ordenes abiertas: {len(orders)}\n"
         f"Circuit breaker: {'ACTIVO' if risk['circuit_breaker_active'] else 'OK'}\n"
         f"Pares habilitados: {pairs or 'N/A'}"
+        f"{fee_line}"
         f"{error_line}"
     )
 
 
 def generate_morning_report() -> str:
-    """Generate the morning Binance balance and readiness report."""
+    """Generate the morning exchange balance and readiness report."""
     try:
-        from execution.binance_executor import save_account_snapshot
+        from execution.crypto_executor import save_account_snapshot
         snapshot = save_account_snapshot()
+        exchange = snapshot.get("exchange", "exchange").title()
         header = (
             f"\U0001f305 <b>REPORTE MATINAL</b>\n"
-            f"Binance total: GBP {snapshot['total_gbp']:,.2f}\n"
+            f"{exchange} total: GBP {snapshot['total_gbp']:,.2f}\n"
             f"Disponible: GBP {snapshot['free_gbp']:,.2f}\n"
-            f"Margen usado: GBP {snapshot['used_gbp']:,.2f}\n\n"
+            f"Reservado/usado: GBP {snapshot['used_gbp']:,.2f}\n\n"
         )
     except Exception as exc:
         header = (
             f"\U0001f305 <b>REPORTE MATINAL</b>\n"
-            f"\u26a0 No se pudo guardar snapshot Binance: {exc}\n\n"
+            f"\u26a0 No se pudo guardar snapshot del exchange: {exc}\n\n"
         )
     return header + generate_readiness_report()
 

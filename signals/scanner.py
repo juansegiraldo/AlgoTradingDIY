@@ -35,7 +35,7 @@ _last_signals: dict[str, str] = {}  # "pair:timeframe" -> "direction:timestamp_h
 def _fetch_ohlcv(pair: str, timeframe: str, market: str, limit: int = 200):
     """Fetch OHLCV data from the appropriate exchange."""
     if market == "crypto":
-        from execution.binance_executor import fetch_ohlcv
+        from execution.crypto_executor import fetch_ohlcv
         return fetch_ohlcv(pair, timeframe, limit)
     # forex and etf fetchers will be added in steps 11 and 12
     elif market == "forex":
@@ -67,6 +67,110 @@ def _is_duplicate(pair: str, timeframe: str, direction: str) -> bool:
 # ---------------------------------------------------------------------------
 # Scan a single pair
 # ---------------------------------------------------------------------------
+
+
+def _indicator_counts(analysis: dict) -> dict:
+    """Return long/short confirmation counts using the signal rules."""
+    rsi = analysis["rsi"]
+    ema = analysis["ema"]
+    macd = analysis["macd"]
+    volume = analysis["volume"]
+
+    long_count = 0
+    short_count = 0
+
+    for indicator in (rsi, ema, macd):
+        if not indicator.get("triggered"):
+            continue
+        if indicator.get("signal") == "long":
+            long_count += 1
+        elif indicator.get("signal") == "short":
+            short_count += 1
+
+    if volume.get("triggered"):
+        if long_count > short_count:
+            long_count += 1
+        elif short_count > long_count:
+            short_count += 1
+
+    return {"long": long_count, "short": short_count}
+
+
+def _diagnose_analysis(pair: str, timeframe: str, market: str, analysis: dict, candles: int) -> dict:
+    settings = get_settings()
+    min_signals = settings.get("indicators", {}).get("min_signals_for_entry", 3)
+    counts = _indicator_counts(analysis)
+    market_cfg = settings.get("markets", {}).get(market, {})
+
+    candidate = None
+    if counts["long"] >= min_signals:
+        candidate = "long"
+    elif counts["short"] >= min_signals:
+        candidate = "short"
+
+    status = "no_signal"
+    reason = f"L{counts['long']}/S{counts['short']} necesita {min_signals}"
+    if candidate == "short" and market_cfg.get("allow_short", True) is False:
+        status = "blocked"
+        reason = f"SHORT {counts['short']}/{min_signals} bloqueado: shorts deshabilitados"
+    elif candidate:
+        status = "signal"
+        reason = f"{candidate.upper()} {counts[candidate]}/{min_signals}"
+
+    trend = analysis.get("trend", {})
+    volatility = analysis.get("volatility", {})
+    return {
+        "pair": pair,
+        "timeframe": timeframe,
+        "market": market,
+        "candles": candles,
+        "price": trend.get("price"),
+        "trend": trend.get("trend", "unknown"),
+        "rsi": analysis.get("rsi", {}),
+        "ema": analysis.get("ema", {}),
+        "macd": analysis.get("macd", {}),
+        "volume": analysis.get("volume", {}),
+        "volatility": volatility,
+        "long_count": counts["long"],
+        "short_count": counts["short"],
+        "min_required": min_signals,
+        "status": status,
+        "reason": reason,
+    }
+
+
+def scan_diagnostics() -> list[dict]:
+    """Scan configured markets and return per-pair diagnostic details."""
+    settings = get_settings()
+    details = []
+
+    crypto = settings["markets"].get("crypto", {})
+    for pair in crypto.get("pairs", []):
+        for tf in crypto.get("timeframes", []):
+            try:
+                ohlcv = _fetch_ohlcv(pair, tf, "crypto")
+                if ohlcv is None or len(ohlcv) < 30:
+                    details.append({
+                        "pair": pair,
+                        "timeframe": tf,
+                        "market": "crypto",
+                        "status": "error",
+                        "reason": f"datos insuficientes ({len(ohlcv) if ohlcv else 0} velas)",
+                    })
+                    continue
+                df = ohlcv_to_dataframe(ohlcv)
+                details.append(_diagnose_analysis(pair, tf, "crypto", analyze(df), len(ohlcv)))
+            except Exception as exc:
+                log_error("scanner", f"Diagnostic scan error {pair} ({tf}): {exc}")
+                details.append({
+                    "pair": pair,
+                    "timeframe": tf,
+                    "market": "crypto",
+                    "status": "error",
+                    "reason": str(exc),
+                })
+
+    return details
 
 
 def scan_pair(pair: str, timeframe: str, market: str) -> Optional[dict]:

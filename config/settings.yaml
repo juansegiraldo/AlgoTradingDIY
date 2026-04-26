@@ -1,14 +1,88 @@
 mode: paper  # paper | semi_auto | full_auto | pause
+live_stage: stage_10  # stage_10 | stage_100 | stage_1000
+
+fx:
+  # Used only when converting GBP capital/PnL to USD-like quote currencies
+  # such as USD, USDT, or USDC. Prefer setting GBP_USD_RATE at runtime.
+  gbp_usd_rate:
+
+live_deployment:
+  require_manual_confirmation: true
+  auto_pause_on_live_failures: true
+  morning_balance_source: kraken
+  readiness_check_timeout_seconds: 15
+  stage_profiles:
+    stage_10:
+      label: "10 GBP"
+      max_operable_capital_gbp: 10
+      risk_per_trade_pct: 5.0
+      max_simultaneous_positions: 1
+      leverage_max: 1
+      allow_partial_tp: false
+      allowed_order_types: ["market"]
+    stage_100:
+      label: "100 GBP"
+      max_operable_capital_gbp: 100
+      risk_per_trade_pct: 0.5
+      max_simultaneous_positions: 2
+      leverage_max: 1
+      allow_partial_tp: true
+      allowed_order_types: ["market"]
+    stage_1000:
+      label: "1000 GBP"
+      max_operable_capital_gbp: 1000
+      risk_per_trade_pct: 1.0
+      max_simultaneous_positions: 3
+      leverage_max: 1
+      allow_partial_tp: true
+      allowed_order_types: ["market"]
+  capital_scaling_tiers:
+    - min_capital_gbp: 0
+      label: "Nano (<GBP25)"
+      max_simultaneous_positions: 1
+      max_position_size_pct: 100
+    - min_capital_gbp: 25
+      label: "Micro (GBP25-50)"
+      max_simultaneous_positions: 1
+      max_position_size_pct: 80
+    - min_capital_gbp: 50
+      label: "Small (GBP50-100)"
+      max_simultaneous_positions: 2
+      max_position_size_pct: 60
+    - min_capital_gbp: 100
+      label: "Medium (GBP100-250)"
+      max_simultaneous_positions: 2
+      max_position_size_pct: 40
+    - min_capital_gbp: 250
+      label: "Growth (GBP250-500)"
+      max_simultaneous_positions: 3
+      max_position_size_pct: 30
+    - min_capital_gbp: 500
+      label: "Standard (GBP500-1000)"
+      max_simultaneous_positions: 3
+      max_position_size_pct: 25
+    - min_capital_gbp: 1000
+      label: "Full (GBP1000+)"
+      max_simultaneous_positions: 5
+      max_position_size_pct: 20
 
 markets:
   crypto:
-    exchange: binance
-    pairs: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    exchange: kraken
+    pairs: ["BTC/GBP", "ETH/GBP", "SOL/GBP"]
     timeframes: ["1h", "4h"]
-    leverage_default: 5
-    leverage_max: 10
-    capital_allocation_pct: 50
-    use_testnet: true  # cambiar a false para live
+    quote_currency: GBP
+    leverage_default: 1
+    leverage_max: 1
+    allow_short: false
+    capital_allocation_pct: 100
+    use_testnet: false
+    fees:
+      # Conservative Kraken Pro spot taker estimate for low-volume market orders.
+      # Actual live fees reported by Kraken are stored when available.
+      taker_fee_pct: 0.40
+      maker_fee_pct: 0.25
+      estimate_round_trip: true
 
   forex:
     broker: oanda
@@ -47,6 +121,15 @@ position_management:
   trailing_stop_pct: 1.5
   trailing_stop_activation: after_tp1
   max_position_size_pct: 20
+  paper_crypto_atr:
+    enabled: true
+    atr_stop_multiplier: 2.5
+    min_stop_loss_pct_by_timeframe:
+      "1h": 3.0
+      "4h": 4.0
+    max_stop_loss_pct: 8.0
+    tp1_r_multiple: 1.5
+    tp2_r_multiple: 2.5
 
 scheduler:
   scanner_interval_minutes: 5

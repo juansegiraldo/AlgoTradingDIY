@@ -3,6 +3,10 @@ config/secrets.yaml
 
 # Database
 data/trades.db
+data/trades.db-*
+.test-db/
+*.db-shm
+*.db-wal
 
 # Python
 __pycache__/
@@ -25,9 +29,19 @@ env/
 # IDE
 .vscode/
 .idea/
+.claude/
+.stubs/
+.work-folder-info
+CLAUDE.md
+29d709a6-1ed8-4c83-82ce-d2ac5b2539fc/
 *.swp
 *.swo
 *~
+
+# Test/cache artifacts
+.pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
 
 # OS
 .DS_Store

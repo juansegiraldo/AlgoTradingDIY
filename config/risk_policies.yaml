@@ -1,11 +1,11 @@
 risk_policies:
-  max_loss_per_trade_pct: 1
+  max_loss_per_trade_pct: 10
   max_loss_daily_pct: 10
   max_loss_weekly_pct: 20
   max_drawdown_total_pct: 50
   max_simultaneous_positions: 3
   correlated_pairs:
-    - ["BTC/USDT", "ETH/USDT"]
+    - ["BTC/GBP", "ETH/GBP"]
     - ["TQQQ", "SOXL"]
   require_stop_loss: true
   forex_no_trade_hours:

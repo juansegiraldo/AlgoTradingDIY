@@ -37,7 +37,7 @@ def render():
 
     # Fetch data
     try:
-        from execution.binance_executor import fetch_ohlcv
+        from execution.crypto_executor import fetch_ohlcv
         ohlcv = fetch_ohlcv(pair, tf, limit=100)
         df = ohlcv_to_dataframe(ohlcv)
     except Exception as e:

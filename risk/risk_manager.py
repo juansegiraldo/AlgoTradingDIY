@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.loader import get_live_stage_profile, get_risk_policies, get_settings
+from config.loader import get_dynamic_limits, get_live_stage_profile, get_risk_policies, get_settings
 from data.database import (
     calculate_current_equity,
     count_open_trades,
@@ -94,18 +94,19 @@ def check_r5_max_positions() -> tuple[bool, str]:
     max_pos = policies.get("max_simultaneous_positions", 3)
     settings = get_settings()
     if settings.get("mode", "paper") != "paper":
-        stage_max = get_live_stage_profile().get("max_simultaneous_positions")
-        if stage_max is not None:
-            max_pos = min(max_pos, int(stage_max))
+        capital = _get_current_capital()
+        dyn = get_dynamic_limits(capital)
+        stage_max = dyn["max_simultaneous_positions"]
+        max_pos = min(max_pos, stage_max)
     current = count_open_trades()
 
     if current >= max_pos:
         return (
             False,
-            f"R5 FAIL: {current} positions open (max {max_pos}). "
-            f"Close a position before opening a new one.",
+            f"R5 FAIL: {current} posiciones abiertas (max {max_pos}). "
+            f"Cierra una posición antes de abrir otra.",
         )
-    return True, f"R5 OK: {current}/{max_pos} positions"
+    return True, f"R5 OK: {current}/{max_pos} posiciones"
 
 
 def check_r6_correlation(pair: str) -> tuple[bool, str]:

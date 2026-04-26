@@ -22,15 +22,23 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.loader import get_risk_policies, get_settings
+from config.loader import get_dynamic_limits, get_live_stage_profile, get_risk_policies, get_settings
 from data.database import calculate_current_equity, log_info
+from execution.crypto_executor import gbp_to_quote
+from execution.fees import estimate_fee_gbp, estimate_round_trip_fee_gbp, get_taker_fee_pct
 
 logger = logging.getLogger(__name__)
 
 
 def _get_current_capital() -> float:
     """Get current total capital (initial + realized PnL)."""
-    return calculate_current_equity()
+    capital = calculate_current_equity()
+    settings = get_settings()
+    if settings.get("mode", "paper") == "paper":
+        return capital
+
+    stage_cap = float(get_live_stage_profile().get("max_operable_capital_gbp", capital) or capital)
+    return min(capital, stage_cap)
 
 
 def _get_market_capital(market: str) -> float:
@@ -86,6 +94,17 @@ def calculate_position(
     market_capital = _get_market_capital(market)
     max_risk_pct = policies.get("max_loss_per_trade_pct", 5) / 100.0
     max_pos_pct = pm.get("max_position_size_pct", 20) / 100.0
+    if settings.get("mode", "paper") != "paper":
+        stage_profile = get_live_stage_profile()
+        stage_risk_pct = stage_profile.get("risk_per_trade_pct")
+        if stage_risk_pct is not None:
+            max_risk_pct = float(stage_risk_pct) / 100.0  # stage profile es autoridad en live
+        stage_leverage_max = stage_profile.get("leverage_max")
+        if stage_leverage_max is not None:
+            leverage = int(min(leverage, int(stage_leverage_max)))
+        # max_position_size_pct dinámico según tier de capital actual
+        dyn = get_dynamic_limits(total_capital)
+        max_pos_pct = dyn["max_position_size_pct"] / 100.0
 
     # 1. Calculate risk amount (max GBP we can lose on this trade)
     risk_amount = total_capital * max_risk_pct
@@ -129,12 +148,16 @@ def calculate_position(
         position_value_gbp = margin_required * leverage
         risk_amount = position_value_gbp * sl_pct
 
-    # 6. Convert to base asset units
-    #    Approximate: assume entry_price is in USD, capital in GBP
-    #    Use rough GBP/USD rate (will be refined when forex is connected)
-    gbp_to_usd = 1.27  # approximate
-    position_value_usd = position_value_gbp * gbp_to_usd
-    position_size = position_value_usd / entry_price
+    # 6. Convert allocated GBP value into the quote currency of the pair.
+    position_value_quote = gbp_to_quote(pair, position_value_gbp)
+    position_size = position_value_quote / entry_price
+    estimated_entry_fee_gbp = estimate_fee_gbp(pair, position_value_quote)
+    estimated_round_trip_fee_gbp = estimate_round_trip_fee_gbp(pair, position_value_quote)
+    fee_breakeven_pct = (
+        (estimated_round_trip_fee_gbp / position_value_gbp) * 100.0
+        if position_value_gbp > 0
+        else 0.0
+    )
 
     risk_pct = (risk_amount / total_capital) * 100
 
@@ -146,6 +169,10 @@ def calculate_position(
         "leverage": leverage,
         "margin_required": round(margin_required, 2),
         "market_capital": round(market_capital, 2),
+        "estimated_entry_fee_gbp": round(estimated_entry_fee_gbp, 4),
+        "estimated_round_trip_fee_gbp": round(estimated_round_trip_fee_gbp, 4),
+        "fee_breakeven_pct": round(fee_breakeven_pct, 3),
+        "fee_rate_pct": get_taker_fee_pct(),
         "approved": True,
         "reason": "Position sized within risk limits",
     }
@@ -155,6 +182,7 @@ def calculate_position(
         f"{pair} {direction.upper()}: size={result['position_size']:.6f} "
         f"value=GBP {result['position_size_value']:.2f} "
         f"risk=GBP {result['risk_amount']:.2f} ({result['risk_pct']:.1f}%) "
+        f"fees~GBP {result['estimated_round_trip_fee_gbp']:.2f} "
         f"margin=GBP {result['margin_required']:.2f} lev={leverage}x",
     )
 
@@ -184,6 +212,10 @@ def enrich_signal_with_sizing(signal: dict) -> dict:
     signal["risk_gbp"] = sizing["risk_amount"]
     signal["risk_pct"] = sizing["risk_pct"]
     signal["margin_required"] = sizing["margin_required"]
+    signal["estimated_entry_fee_gbp"] = sizing.get("estimated_entry_fee_gbp", 0.0)
+    signal["estimated_round_trip_fee_gbp"] = sizing.get("estimated_round_trip_fee_gbp", 0.0)
+    signal["fee_breakeven_pct"] = sizing.get("fee_breakeven_pct", 0.0)
+    signal["fee_rate_pct"] = sizing.get("fee_rate_pct", 0.0)
     signal["sizing_approved"] = sizing["approved"]
     signal["sizing_reason"] = sizing["reason"]
 
